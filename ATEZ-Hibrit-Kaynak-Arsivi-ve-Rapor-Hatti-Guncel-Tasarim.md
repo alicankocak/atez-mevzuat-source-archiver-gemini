@@ -33,7 +33,7 @@ değiştiremez.
     Birincil fihrist: https://resmigazete.gov.tr/DD.MM.YYYY
     Hata alias'ı: https://www.resmigazete.gov.tr/DD.MM.YYYY
 
-    GitHub deposu: alicankocak/atez-mevzuat-radari-fetcher
+    GitHub deposu: alicankocak/atez-mevzuat-source-archiver-gemini
     Drive kökü: ATEZ-Mevzuat-Radari-V2
     Drive kök kimliği: 1TONr3xXlRbOfClJKPZJ_Q3mbFqzBEiTE
     Gmail gönderici: atezmevzuat@gmail.com
@@ -120,7 +120,7 @@ Kullanıcı 1 Temmuz 2026 için rapor oluştur dediğinde AI şu sıra ile ilerl
    Action'ı doğrudan tetikler. Drive'a PENDING dosyası yazılmaz ve ayrı bir
    Drive kuyruk Action'ı yoktur.
 
-    Repository: alicankocak/atez-mevzuat-radari-fetcher
+    Repository: alicankocak/atez-mevzuat-source-archiver-gemini
     Title: SOURCE_REQUEST — 2026-07-01
     Body (yalnız JSON):
     {"schema_version":1,"report_date":"2026-07-01","drive_target_path":"2026-07-01/sources"}

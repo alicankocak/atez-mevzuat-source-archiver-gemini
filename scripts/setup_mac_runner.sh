@@ -6,7 +6,7 @@
 set -e
 
 RUNNER_DIR="$HOME/actions-runner-atez"
-REPO_URL="https://github.com/alicankocak/atez-mevzuat-radari-fetcher"
+REPO_URL="https://github.com/alicankocak/atez-mevzuat-source-archiver-gemini"
 LATEST_RUNNER_VER="2.321.0"
 RUNNER_ARCH="osx-arm64"
 
