@@ -188,9 +188,8 @@ class MevzuatFetcher:
                 break
 
         if not teblig_header:
-            raise InvalidSourceResponse(
-                "Fihristte 'TEBLİĞ' veya 'TEBLİĞLER' başlığı bulunamadı."
-            )
+            logger.info("Fihristte Tebliğ bölümü bulunmadı.")
+            return []
 
         # Traverse siblings until next section header
         curr = teblig_header.find_next_sibling()
@@ -222,6 +221,16 @@ class MevzuatFetcher:
 
         logger.info(f"Toplam {len(teblig_items)} adet Tebliğ bulundu.")
         return teblig_items
+
+    def validate_fihrist_structure(self, soup: BeautifulSoup) -> str:
+        """Validates Gazette identity and index structure independently of sections."""
+        rg_number = self.extract_resmi_gazete_number(soup)
+        section_headers = soup.find_all(class_=re.compile(r"html-subtitle", re.I))
+        if not any(header.get_text(strip=True) for header in section_headers):
+            raise InvalidSourceResponse(
+                "Fihrist geçerli bir Resmî Gazete bölüm yapısı içermiyor."
+            )
+        return rg_number
 
     def download_file(self, url: str, target_path: Path, role: str, parent_doc_id: Optional[str] = None) -> FileManifest:
         """Downloads a single file, saves locally, computes sha256 and metadata."""
@@ -361,7 +370,7 @@ class MevzuatFetcher:
             )
 
         soup = BeautifulSoup(fihrist_response.body, "html.parser")
-        rg_number = self.extract_resmi_gazete_number(soup)
+        rg_number = self.validate_fihrist_structure(soup)
         rg_folder_name = f"rg-{rg_number}"
         rg_dir = self.output_base_dir / rg_folder_name
         rg_dir.mkdir(parents=True, exist_ok=True)

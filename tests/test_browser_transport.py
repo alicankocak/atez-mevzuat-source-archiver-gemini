@@ -268,6 +268,46 @@ def test_rejects_http_200_html_login_or_challenge(body):
         validate_browser_response(url, response)
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        (
+            b"<!doctype html><title>Resmi Gazete</title>"
+            b"<main><h1>Access denied</h1><p>Your request was blocked.</p></main>"
+        ),
+        (
+            b"<!doctype html><title>Resmi Gazete</title>"
+            b"<form action='/session'><input name='username'>"
+            b"<input type='password' name='secret'></form>"
+        ),
+    ],
+)
+def test_rejects_http_200_html_structural_error_or_login_page(body):
+    url = "https://resmigazete.gov.tr/document.html"
+    response = BrowserResponse(200, url, "text/html; charset=utf-8", body)
+
+    with pytest.raises(InvalidSourceResponse):
+        validate_browser_response(url, response)
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Bakım Usul ve Esasları Hakkında Tebliğ",
+        "Hata Payı Hesaplama Usulü Hakkında Tebliğ",
+        "Giriş ve Bildirim İşlemleri Hakkında Tebliğ",
+    ],
+)
+def test_accepts_legitimate_html_with_error_like_word_in_title(title):
+    url = "https://resmigazete.gov.tr/document.html"
+    body = f"<!doctype html><title>{title}</title><article><h1>{title}</h1></article>".encode(
+        "utf-8"
+    )
+    response = BrowserResponse(200, url, "text/html; charset=utf-8", body)
+
+    validate_browser_response(url, response)
+
+
 def test_rejects_non_html_payload_masquerading_as_html_document():
     url = "https://resmigazete.gov.tr/document.html"
     response = BrowserResponse(200, url, "application/octet-stream", b"not html")
@@ -495,19 +535,9 @@ def test_fetcher_falls_back_to_alias_on_primary_server_error(tmp_path):
     assert transport.fetched_urls == [primary_url, alias_url]
 
 
-@pytest.mark.parametrize(
-    "fihrist_body",
-    [
-        b"<!doctype html><title>Resmi Gazete</title><p>empty shell</p>",
-        (
-            "<!doctype html><title>Resmî Gazete</title>"
-            "<span id='spanGazeteTarih'>33299 Sayılı Resmî Gazete</span>"
-            "<h2 class='html-subtitle'>İLANLAR</h2>"
-        ).encode(),
-    ],
-)
-def test_run_rejects_fihrist_without_required_structure(tmp_path, fihrist_body):
+def test_run_rejects_fihrist_without_required_structure(tmp_path):
     url = "https://resmigazete.gov.tr/14.08.2026"
+    fihrist_body = b"<!doctype html><title>Resmi Gazete</title><p>empty shell</p>"
     transport = FakeTransport(
         {url: BrowserResponse(200, url, "text/html; charset=utf-8", fihrist_body)}
     )
@@ -519,6 +549,54 @@ def test_run_rejects_fihrist_without_required_structure(tmp_path, fihrist_body):
 
     with pytest.raises(InvalidSourceResponse):
         fetcher.run()
+
+
+def test_run_rejects_issue_page_without_index_structure(tmp_path):
+    url = "https://resmigazete.gov.tr/14.08.2026"
+    fihrist_body = (
+        "<!doctype html><title>33299 Sayılı Resmî Gazete</title>"
+        "<span id='spanGazeteTarih'>33299 Sayılı Resmî Gazete</span>"
+        "<main><p>Bu sayfa bir fihrist değildir.</p></main>"
+    ).encode("utf-8")
+    transport = FakeTransport(
+        {url: BrowserResponse(200, url, "text/html; charset=utf-8", fihrist_body)}
+    )
+    fetcher = MevzuatFetcher(
+        "2026-08-14",
+        output_base_dir=tmp_path,
+        transport=transport,
+    )
+
+    with pytest.raises(InvalidSourceResponse):
+        fetcher.run()
+
+
+def test_run_accepts_valid_fihrist_without_teblig_section(tmp_path):
+    url = "https://resmigazete.gov.tr/14.08.2026"
+    fihrist_body = (
+        "<!doctype html>"
+        "<title>14 Ağustos 2026 Tarihli ve 33299 Sayılı Resmî Gazete</title>"
+        "<span id='spanGazeteTarih'>33299 Sayılı Resmî Gazete</span>"
+        "<h2 class='html-subtitle'>YÜRÜTME VE İDARE BÖLÜMÜ</h2>"
+        "<div class='fihrist-item mb-1'>"
+        "<a href='/eskiler/2026/08/20260814-1.pdf'>Cumhurbaşkanı Kararı</a>"
+        "</div>"
+    ).encode("utf-8")
+    transport = FakeTransport(
+        {url: BrowserResponse(200, url, "text/html; charset=utf-8", fihrist_body)}
+    )
+    fetcher = MevzuatFetcher(
+        "2026-08-14",
+        output_base_dir=tmp_path,
+        transport=transport,
+    )
+
+    manifest, rg_dir = fetcher.run()
+
+    assert manifest.resmi_gazete_sayisi == "33299"
+    assert manifest.documents == []
+    assert (rg_dir / "index.html").read_bytes() == fihrist_body
+    assert (rg_dir / "source-manifest.json").is_file()
 
 
 def test_download_file_preserves_transport_bytes_and_content_type(tmp_path):

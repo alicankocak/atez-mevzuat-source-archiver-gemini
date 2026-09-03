@@ -7,6 +7,7 @@ from pathlib import PurePosixPath
 from typing import Iterable
 from urllib.parse import urljoin, urlparse
 
+from bs4 import BeautifulSoup
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -118,39 +119,84 @@ def _validate_html_response(response: BrowserResponse) -> None:
             response=response,
         )
 
-    text = sample.decode("utf-8", errors="ignore").casefold()
-    title_match = re.search(r"<title\b[^>]*>(.*?)</title\s*>", text, re.DOTALL)
-    title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else ""
-    blocked_title_markers = (
+    soup = BeautifulSoup(sample, "html.parser")
+
+    def normalized_text(value: str) -> str:
+        return re.sub(r"\s+", " ", value).strip().casefold()
+
+    title = normalized_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
+    blocked_title_phrases = (
         "access denied",
         "attention required",
-        "bakım",
-        "error",
-        "forbidden",
-        "giriş",
-        "hata",
+        "internal server error",
         "just a moment",
-        "login",
-        "maintenance",
         "oturum aç",
         "security check",
         "service unavailable",
         "sign in",
-        "unauthorized",
     )
+    blocked_title_values = {"forbidden", "login", "maintenance", "unauthorized"}
     challenge_markers = (
         "checking your browser",
         "cf-chl-",
         "captcha",
         "verify you are human",
     )
-    has_login_form = "<form" in text and any(
-        marker in text
-        for marker in ("type=password", 'type="password"', "name=password", "login")
+    body_text = normalized_text(soup.get_text(" ", strip=True))
+    markup = str(soup).casefold()
+    strong_body_error_phrases = (
+        "access denied",
+        "access forbidden",
+        "internal server error",
+        "permission denied",
+        "request blocked",
+        "service unavailable",
+        "erişim engellendi",
+        "erişim reddedildi",
+        "yetkisiz erişim",
     )
+    generic_error_values = {"error", "forbidden", "hata", "unauthorized"}
+    error_elements = soup.find_all(["h1", "h2", "h3"])
+    error_elements.extend(soup.find_all(attrs={"role": "alert"}))
+    has_structural_error = False
+    for element in error_elements:
+        element_text = normalized_text(element.get_text(" ", strip=True))
+        if (
+            any(marker in element_text for marker in strong_body_error_phrases)
+            or element_text.strip(" .:;!|-") in generic_error_values
+        ):
+            has_structural_error = True
+            break
+
+    has_password_input = any(
+        str(field.get("type", "")).strip().casefold() == "password"
+        for field in soup.find_all("input")
+    )
+    login_form_pattern = re.compile(
+        r"login|log[-_ ]?in|sign[-_ ]?in|giriş|giris|oturum",
+        re.IGNORECASE,
+    )
+    has_login_form = False
+    for form in soup.find_all("form"):
+        attribute_text = " ".join(
+            " ".join(value) if isinstance(value, list) else str(value)
+            for name, value in form.attrs.items()
+            if name in {"action", "class", "id", "name"}
+        )
+        form_text = normalized_text(form.get_text(" ", strip=True))
+        if login_form_pattern.search(attribute_text) or any(
+            phrase in form_text for phrase in ("sign in", "giriş yap", "oturum aç")
+        ):
+            has_login_form = True
+            break
+
     if (
-        any(marker in title for marker in blocked_title_markers)
-        or any(marker in text for marker in challenge_markers)
+        any(marker in title for marker in blocked_title_phrases)
+        or title.strip(" .:;!|-") in blocked_title_values
+        or any(marker in body_text or marker in markup for marker in challenge_markers)
+        or any(marker in body_text for marker in strong_body_error_phrases)
+        or has_structural_error
+        or has_password_input
         or has_login_form
     ):
         raise InvalidSourceResponse(
