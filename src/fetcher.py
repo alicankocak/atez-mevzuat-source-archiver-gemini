@@ -1,4 +1,3 @@
-import os
 import re
 import hashlib
 import logging
@@ -6,16 +5,19 @@ from pathlib import Path
 from typing import Tuple, List, Optional, Dict
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
-import requests
-from playwright.sync_api import sync_playwright
 
+from src.browser_transport import (
+    BrowserResponse,
+    InvalidSourceResponse,
+    OfficialBrowserTransport,
+    RetryableTransportError,
+    UnsafeSourceUrl,
+    validate_official_url,
+)
 from src.config import (
-    PRIMARY_DOMAIN,
-    ALIAS_DOMAIN,
     PRIMARY_FIHRIST_TEMPLATE,
     ALIAS_FIHRIST_TEMPLATE,
     ALLOWED_ATTACHMENT_EXTENSIONS,
-    DEFAULT_USER_AGENT,
     DOWNLOADS_DIR,
 )
 from src.models import (
@@ -23,9 +25,6 @@ from src.models import (
     DocumentItem,
     SourceManifest,
 )
-
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger("atez.fetcher")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -56,19 +55,21 @@ def normalize_date_formats(date_input: str) -> Tuple[str, str]:
 
 
 class MevzuatFetcher:
-    def __init__(self, date_str: str, output_base_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        date_str: str,
+        output_base_dir: Optional[Path] = None,
+        transport: Optional[OfficialBrowserTransport] = None,
+    ):
         self.iso_date, self.display_date = normalize_date_formats(date_str)
         self.output_base_dir = output_base_dir or (DOWNLOADS_DIR / self.iso_date / "sources")
         self.output_base_dir.mkdir(parents=True, exist_ok=True)
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
-        self.session.verify = False
+        self.transport = transport or OfficialBrowserTransport()
 
-    def fetch_fihrist_page(self) -> Tuple[str, str, int]:
+    def fetch_fihrist_page(self) -> BrowserResponse:
         """
-        Loads fihrist page using Playwright.
+        Loads the fihrist page using the constrained browser transport.
         Tries primary URL, falls back to alias URL on network/5xx errors.
-        Returns: (html_content, final_url, status_code)
         """
         urls_to_try = [
             PRIMARY_FIHRIST_TEMPLATE.format(date_str=self.display_date),
@@ -79,34 +80,18 @@ class MevzuatFetcher:
         for target_url in urls_to_try:
             logger.info(f"Fihrist sayfası deneniyor: {target_url}")
             try:
-                with sync_playwright() as p:
-                    browser = p.chromium.launch(headless=True)
-                    context = browser.new_context(user_agent=DEFAULT_USER_AGENT, ignore_https_errors=True)
-                    page = context.new_page()
-                    response = page.goto(target_url, wait_until="networkidle", timeout=30000)
-
-                    if response is None:
-                        raise Exception(f"Boş yanıt alındı: {target_url}")
-
-                    status = response.status
-                    logger.info(f"HTTP Yanıt Kodu: {status} ({target_url})")
-
-                    if status == 404:
-                        logger.warning(f"Resmî Gazete fihristi bulunamadı (404): {target_url}")
-                        browser.close()
-                        return "", target_url, 404
-
-                    if 500 <= status < 600:
-                        logger.warning(f"5xx Sunucu hatası ({status}), alias denenecek.")
-                        browser.close()
-                        continue
-
-                    content = page.content()
-                    final_url = page.url
-                    browser.close()
-                    return content, final_url, status
-
-            except Exception as e:
+                response = self.transport.fetch(target_url)
+                logger.info(f"HTTP Yanıt Kodu: {response.status} ({target_url})")
+                return response
+            except InvalidSourceResponse as e:
+                response = e.response
+                if response is not None and response.status == 404:
+                    return response
+                if response is None or not 500 <= response.status < 600:
+                    raise
+                logger.warning(f"5xx Sunucu hatası ({response.status}), alias denenecek.")
+                last_error = e
+            except RetryableTransportError as e:
                 logger.warning(f"Fihrist yükleme hatası ({target_url}): {e}")
                 last_error = e
 
@@ -211,22 +196,19 @@ class MevzuatFetcher:
         logger.info(f"İndiriliyor [{role}]: {url} -> {target_path}")
 
         try:
-            resp = self.session.get(url, timeout=30, allow_redirects=True)
-            status_code = resp.status_code
-            content_type = resp.headers.get("Content-Type", "application/octet-stream")
-            final_url = resp.url
+            response = self.transport.fetch(url)
 
             with open(target_path, "wb") as f:
-                f.write(resp.content)
+                f.write(response.body)
 
             size_bytes = target_path.stat().st_size
             sha256_hash = compute_sha256(target_path)
 
             return FileManifest(
                 source_url=url,
-                final_url=final_url,
-                http_status=status_code,
-                content_type=content_type,
+                final_url=response.final_url,
+                http_status=response.status,
+                content_type=response.content_type,
                 size_bytes=size_bytes,
                 sha256=sha256_hash,
                 role=role, # type: ignore
@@ -277,13 +259,15 @@ class MevzuatFetcher:
                     if not href:
                         continue
                     abs_url = urljoin(url, href)
-                    parsed_att = urlparse(abs_url)
+                    try:
+                        validate_official_url(abs_url)
+                    except UnsafeSourceUrl:
+                        continue
 
-                    # Only allow attachments from same official domain
-                    if parsed_att.netloc in ["resmigazete.gov.tr", "www.resmigazete.gov.tr"]:
-                        ext = Path(parsed_att.path).suffix.lower()
-                        if ext in ALLOWED_ATTACHMENT_EXTENSIONS and abs_url != url:
-                            attachment_urls.add(abs_url)
+                    parsed_att = urlparse(abs_url)
+                    ext = Path(parsed_att.path).suffix.lower()
+                    if ext in ALLOWED_ATTACHMENT_EXTENSIONS and abs_url != url:
+                        attachment_urls.add(abs_url)
 
                 for att_url in sorted(attachment_urls):
                     att_name = Path(urlparse(att_url).path).name
@@ -325,11 +309,14 @@ class MevzuatFetcher:
         4. Save source-manifest.json
         Returns: (SourceManifest, rg_dir_path)
         """
-        html_content, final_url, status = self.fetch_fihrist_page()
-        if status == 404 or not html_content:
-            raise FileNotFoundError(f"{self.display_date} tarihli Resmî Gazete fihristi bulunamadı (HTTP {status}).")
+        fihrist_response = self.fetch_fihrist_page()
+        if fihrist_response.status == 404 or not fihrist_response.body:
+            raise FileNotFoundError(
+                f"{self.display_date} tarihli Resmî Gazete fihristi bulunamadı "
+                f"(HTTP {fihrist_response.status})."
+            )
 
-        soup = BeautifulSoup(html_content, "html.parser")
+        soup = BeautifulSoup(fihrist_response.body, "html.parser")
         rg_number = self.extract_resmi_gazete_number(soup)
         rg_folder_name = f"rg-{rg_number}"
         rg_dir = self.output_base_dir / rg_folder_name
@@ -337,14 +324,14 @@ class MevzuatFetcher:
 
         # Save index.html
         index_file_path = rg_dir / "index.html"
-        with open(index_file_path, "w", encoding="utf-8") as f:
-            f.write(html_content)
+        with open(index_file_path, "wb") as f:
+            f.write(fihrist_response.body)
 
         index_manifest = FileManifest(
-            source_url=final_url,
-            final_url=final_url,
-            http_status=status,
-            content_type="text/html; charset=utf-8",
+            source_url=fihrist_response.final_url,
+            final_url=fihrist_response.final_url,
+            http_status=fihrist_response.status,
+            content_type=fihrist_response.content_type,
             size_bytes=index_file_path.stat().st_size,
             sha256=compute_sha256(index_file_path),
             role="daily_index",
@@ -352,7 +339,7 @@ class MevzuatFetcher:
         )
 
         # Extract & Process Tebliğler
-        teblig_items = self.extract_tebligler(soup, final_url)
+        teblig_items = self.extract_tebligler(soup, fihrist_response.final_url)
         documents = []
         for idx, teblig in enumerate(teblig_items, start=1):
             doc_item = self.process_teblig_document(teblig, idx, rg_dir)
@@ -361,7 +348,7 @@ class MevzuatFetcher:
         source_manifest = SourceManifest(
             report_date=self.iso_date,
             resmi_gazete_sayisi=rg_number,
-            fihrist_url=final_url,
+            fihrist_url=fihrist_response.final_url,
             index_file=index_manifest,
             documents=documents,
         )
