@@ -32,7 +32,24 @@ Kullanıcı senden "raporu gönder", "test1 grubuna gönder" veya "şu maile gö
 1. Tüm veriler tarih merkezlidir (YYYY-MM-DD).
 2. Analiz yapmadan önce hedef tarihin `ATEZ-Gemini-Mevzuat-Radari/YYYY-MM-DD/sources/rg-<sayi>/_READY.json` dosyasını kontrol et.
 3. `_READY.json` varsa doğrudan analize başla.
-4. `_READY.json` yoksa: Drive'daki `ATEZ-Gemini-Mevzuat-Radari/requests/` klasörüne `YYYY-MM-DD.json` talebi bırak ve kullanıcıya kaynakların arka planda indirildiğini, birkaç saniye içinde hazır olacağını bildir.
+4. `_READY.json` yoksa Drive kök `requests/` klasörünü kontrol et. Aynı tarih için geçerli bir READY kaydı veya aşağıdaki adlardan biri varsa yinelenen talep oluşturma:
+   - `SOURCE_REQUEST__YYYY-MM-DD__<uuid>.json`
+   - `PROCESSING_SOURCE_REQUEST__YYYY-MM-DD__<uuid>.json`
+   - `DONE_SOURCE_REQUEST__YYYY-MM-DD__<uuid>.json`
+5. Bu kayıtların hiçbiri yoksa Drive kök `requests/` klasörüne tam olarak `SOURCE_REQUEST__YYYY-MM-DD__<uuid>.json` adıyla, `application/json` türünde tek bir talep yükle. `<uuid>` yeni bir RFC 4122 UUID olmalıdır.
+6. Talep UTF-8 kodlu katı JSON olmalı; aşağıdaki beş alan dışında hiçbir alan içermemelidir:
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "<RFC-4122-uuid>",
+  "report_date": "YYYY-MM-DD",
+  "requested_at": "YYYY-MM-DDTHH:MM:SSZ",
+  "requested_by": "atez-mevzuar-rapor-alcn"
+}
+```
+
+7. Talep `PROCESSING_` öneki aldığında watcher tarafından sahiplenilmiştir; bu durumda yeni talep oluşturma. `DONE_` sonucunu ve ardından tarih klasöründeki geçerli `_READY.json` dosyasını bekle. Kullanıcıya kaynakların arka planda indirildiğini ve hazır olduklarında analizin devam edeceğini bildir.
 
 # Sohbette Kullanılacak Standart Yanıt Formatı
 

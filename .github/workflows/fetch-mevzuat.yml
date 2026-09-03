@@ -10,23 +10,11 @@ on:
         description: 'Arşivlenecek Tarih (DD.MM.YYYY veya YYYY-MM-DD)'
         required: false
         default: ''
-  issues:
-    types: [opened]
 
 jobs:
   archive-sources:
     # Yalnızca self-hosted macOS runner üzerinde çalışır
     runs-on: [self-hosted, macOS]
-    
-    # Issue tetiklendiğinde yetkili kullanıcı ve başlık doğrulaması
-    if: |
-      github.event_name != 'issues' ||
-      (
-        (github.event.issue.author_association == 'OWNER' ||
-         github.event.issue.author_association == 'MEMBER' ||
-         github.event.issue.author_association == 'COLLABORATOR') &&
-        startsWith(github.event.issue.title, 'SOURCE_REQUEST —')
-      )
 
     steps:
       - name: Checkout Depo
@@ -48,10 +36,6 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.report_date }}" ]; then
             echo "TARGET_DATE=${{ github.event.inputs.report_date }}" >> $GITHUB_ENV
-          elif [ "${{ github.event_name }}" = "issues" ]; then
-            # Issue başlığından tarihi çıkar (SOURCE_REQUEST — YYYY-MM-DD)
-            ISSUE_DATE=$(echo "${{ github.event.issue.title }}" | sed 's/SOURCE_REQUEST — //')
-            echo "TARGET_DATE=$ISSUE_DATE" >> $GITHUB_ENV
           else
             echo "TARGET_DATE=" >> $GITHUB_ENV
           fi
@@ -68,21 +52,3 @@ jobs:
           else
             python -m src.main
           fi
-
-      - name: Issue Başarılı Kapatma
-        if: github.event_name == 'issues' && success()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: '✅ Kaynaklar başarıyla indirildi, doğrulandı ve Google Drive (`_READY.json`) arşivine yüklendi.'
-            });
-            await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              state: 'closed'
-            });
