@@ -34,8 +34,8 @@ değiştiremez.
     Hata alias'ı: https://www.resmigazete.gov.tr/DD.MM.YYYY
 
     GitHub deposu: alicankocak/atez-mevzuat-source-archiver-gemini
-    Drive kökü: ATEZ-Mevzuat-Radari-V2
-    Drive kök kimliği: 1TONr3xXlRbOfClJKPZJ_Q3mbFqzBEiTE
+    Drive kökü: ATEZ-Mevzuat-Radari-Gemini
+    Drive kök kimliği: 1xrSozns-2sMBJRUuY3JvglVdSnKX1hDc
     Gmail gönderici: atezmevzuat@gmail.com
 
     Test grubu:

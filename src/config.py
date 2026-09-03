@@ -14,8 +14,8 @@ ALIAS_FIHRIST_TEMPLATE = "https://www.resmigazete.gov.tr/{date_str}"
 
 # GitHub & Drive config
 GITHUB_REPO = os.getenv("GITHUB_REPO", "alicankocak/atez-mevzuat-source-archiver-gemini")
-DRIVE_ROOT_FOLDER_NAME = "ATEZ-Mevzuat-Radari-V2"
-DRIVE_ROOT_FOLDER_ID = os.getenv("DRIVE_ROOT_FOLDER_ID", "1TONr3xXlRbOfClJKPZJ_Q3mbFqzBEiTE")
+DRIVE_ROOT_FOLDER_NAME = "ATEZ-Mevzuat-Radari-Gemini"
+DRIVE_ROOT_FOLDER_ID = os.getenv("DRIVE_ROOT_FOLDER_ID", "1xrSozns-2sMBJRUuY3JvglVdSnKX1hDc")
 
 # Subfolder names
 SUBFOLDERS = ["requests", "sources", "analyses", "reports", "deliveries"]
