@@ -1,6 +1,42 @@
+import re
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional, Literal
-from pydantic import BaseModel, Field
-from datetime import datetime, timezone
+
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
+
+
+class SourceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    schema_version: Literal[1]
+    request_id: str = Field(min_length=1, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    report_date: date
+    requested_at: AwareDatetime
+    requested_by: Literal["atez-mevzuar-rapor-alcn"]
+
+    @field_validator("report_date", mode="before")
+    @classmethod
+    def require_iso_report_date(cls, value):
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            raise ValueError("report_date must use YYYY-MM-DD")
+        return date.fromisoformat(value)
+
+    @field_validator("requested_at")
+    @classmethod
+    def require_utc_requested_at(cls, value: datetime) -> datetime:
+        if value.utcoffset() != timedelta(0):
+            raise ValueError("requested_at must be timezone-aware UTC")
+        return value
+
+
+class SourceRequestResult(SourceRequest):
+    status: Literal["DONE", "FAILED"]
+    completed_at: AwareDatetime
+    rg_number: Optional[str] = None
+    ready_file_id: Optional[str] = None
+    error: Optional[str] = None
 
 
 class FileManifest(BaseModel):
