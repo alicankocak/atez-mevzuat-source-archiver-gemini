@@ -154,12 +154,15 @@ class DriveRequestWatcher:
         self._write_result(file_id, self._terminal_name("FAILED", request), result)
 
     def _fail_invalid_request(self, file_id: str, old_name: str, error: str) -> None:
+        terminal_source_name = old_name.removeprefix("PROCESSING_")
         payload = json.dumps(
             {
                 "schema_version": 1,
                 "status": "FAILED",
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "error": f"INVALID_REQUEST: {error}",
+                "request_file_id": file_id,
+                "request_file_name": terminal_source_name,
             },
             indent=2,
         ).encode("utf-8")
@@ -168,7 +171,7 @@ class DriveRequestWatcher:
         )
         self.uploader.service.files().update(
             fileId=file_id,
-            body={"name": f"FAILED_{old_name}"},
+            body={"name": f"FAILED_{terminal_source_name}"},
             media_body=media,
         ).execute()
 
@@ -246,11 +249,18 @@ class DriveRequestWatcher:
     def _recover_stale_claims(self) -> List[Dict]:
         recovered = []
         for file_info in self._list_processing_requests():
+            if not self._processing_claim_is_stale(file_info):
+                continue
             try:
                 request = self.load_request(file_info["id"])
-            except (ValidationError, ValueError, TypeError):
-                continue
-            if not self._processing_claim_is_stale(file_info):
+            except (ValidationError, ValueError, TypeError) as error:
+                self._fail_invalid_request(
+                    file_info["id"], file_info["name"], str(error)
+                )
+                logger.warning(
+                    "Süresi dolan geçersiz talep FAILED durumuna alındı: %s",
+                    file_info["id"],
+                )
                 continue
             report_date = request.report_date.isoformat()
             with self._date_claim_lock(report_date) as acquired:

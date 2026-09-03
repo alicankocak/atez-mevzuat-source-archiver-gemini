@@ -396,6 +396,30 @@ def test_stale_processing_claim_returns_to_pending(watcher, drive):
     assert drive.updates[-1]["body"]["name"] == pending[0]["name"]
 
 
+def test_stale_invalid_processing_claim_is_terminalized(watcher, drive):
+    stale_file = {
+        "id": "stale-invalid",
+        "name": "PROCESSING_SOURCE_REQUEST__untrusted-name.json",
+        "appProperties": {"claimed_at": "2000-01-01T00:00:00Z"},
+    }
+    drive.processing_files = [stale_file]
+    drive.media["stale-invalid"] = b"archive 2026-08-14 please"
+
+    pending = watcher.list_pending_requests()
+
+    assert pending == []
+    update = drive.updates[-1]
+    assert update["file_id"] == "stale-invalid"
+    assert update["body"]["name"] == "FAILED_SOURCE_REQUEST__untrusted-name.json"
+    result = json.loads(update["media"])
+    assert result["status"] == "FAILED"
+    assert "INVALID_REQUEST" in result["error"]
+    assert result["request_file_id"] == "stale-invalid"
+    assert result["request_file_name"] == "SOURCE_REQUEST__untrusted-name.json"
+    assert "request_id" not in result
+    assert "report_date" not in result
+
+
 def test_same_mac_watchers_cannot_collect_same_date_concurrently(
     monkeypatch, watcher, drive, tmp_path
 ):
