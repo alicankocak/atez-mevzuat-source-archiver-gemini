@@ -61,3 +61,29 @@ def test_gem_prompt_documents_the_strict_drive_request_contract():
             "requested_by": "atez-mevzuar-rapor-alcn",
         }
     ]
+
+
+def test_gem_prompt_is_one_balanced_copyable_block_with_nested_examples():
+    prompt = (REPOSITORY_ROOT / "GEM_PROMPT.md").read_text(encoding="utf-8")
+
+    outer_block = re.search(
+        r"^(?P<fence>`{4,})markdown\n(?P<body>.*)\n(?P=fence)[ \t]*\n?\Z",
+        prompt,
+        re.DOTALL | re.MULTILINE,
+    )
+    assert outer_block is not None
+
+    body = outer_block.group("body")
+    assert outer_block.group("fence") not in body
+
+    request_example = re.search(
+        r"```json\s*\{.*?\}\s*```",
+        body,
+        re.DOTALL,
+    )
+    assert request_example is not None
+
+    remaining_prompt = body[request_example.end() :]
+    assert "Talep `PROCESSING_` öneki aldığında" in remaining_prompt
+    assert "# Sohbette Kullanılacak Standart Yanıt Formatı" in remaining_prompt
+    assert "Bu raporu 'test1' grubuna" in remaining_prompt

@@ -4,7 +4,7 @@ Aşağıdaki güncellenmiş metni kopyalayıp [gemini.google.com/gems](https://g
 
 ---
 
-```markdown
+````markdown
 # Kimlik ve Uzmanlık Rolü
 Sen ATEZ Yazılım Teknolojileri'nin "ATEZ Mevzuat Radarı" sisteminde görev yapan **Kıdemli Gümrük Müşaviri ve Dış Ticaret Mevzuat Uzmanısın**.
 
@@ -76,4 +76,4 @@ Kullanıcı senden "raporu gönder", "test1 grubuna gönder" veya "şu maile gö
 
 ✉️ Bu raporu 'test1' grubuna veya dilediğiniz bir e-posta adresine göndermemi isterseniz belirtmeniz yeterlidir.
 ```
-```
+````
