@@ -1,9 +1,11 @@
-import re
 import hashlib
 import logging
+import re
+import unicodedata
 from pathlib import Path
-from typing import Tuple, List, Optional, Dict
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
+
 from bs4 import BeautifulSoup
 
 from src.browser_transport import (
@@ -28,6 +30,35 @@ from src.models import (
 
 logger = logging.getLogger("atez.fetcher")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+_RESERVED_DOCUMENT_FILENAMES = frozenset(
+    {"source.html", "source.pdf", "manifest.json"}
+)
+
+
+def _filename_key(filename: str) -> str:
+    return unicodedata.normalize("NFC", filename).casefold()
+
+
+def _allocate_attachment_filename(url: str, used_names: set[str]) -> str:
+    original_name = Path(urlparse(url).path).name or "attachment.dat"
+    candidate = original_name
+    candidate_key = _filename_key(candidate)
+    if candidate_key in used_names:
+        path = Path(original_name)
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+        candidate = f"{path.stem or 'attachment'}__{digest}{path.suffix}"
+        candidate_key = _filename_key(candidate)
+        counter = 2
+        while candidate_key in used_names:
+            candidate = (
+                f"{path.stem or 'attachment'}__{digest}_{counter}{path.suffix}"
+            )
+            candidate_key = _filename_key(candidate)
+            counter += 1
+
+    used_names.add(candidate_key)
+    return candidate
 
 
 def compute_sha256(file_path: Path) -> str:
@@ -136,8 +167,9 @@ class MevzuatFetcher:
         if match_title:
             return match_title.group(1)
 
-        # 5. Fallback to date without dashes if unknown
-        return self.iso_date.replace("-", "")
+        raise InvalidSourceResponse(
+            "Fihrist geçerli bir Resmî Gazete sayısı içermiyor."
+        )
 
     def extract_tebligler(self, soup: BeautifulSoup, base_url: str) -> List[Dict[str, str]]:
         """
@@ -156,8 +188,9 @@ class MevzuatFetcher:
                 break
 
         if not teblig_header:
-            logger.info("Fihristte 'TEBLİĞ' veya 'TEBLİĞLER' başlığı bulunamadı.")
-            return []
+            raise InvalidSourceResponse(
+                "Fihristte 'TEBLİĞ' veya 'TEBLİĞLER' başlığı bulunamadı."
+            )
 
         # Traverse siblings until next section header
         curr = teblig_header.find_next_sibling()
@@ -197,27 +230,40 @@ class MevzuatFetcher:
 
         try:
             response = self.transport.fetch(url)
-
-            with open(target_path, "wb") as f:
-                f.write(response.body)
-
-            size_bytes = target_path.stat().st_size
-            sha256_hash = compute_sha256(target_path)
-
-            return FileManifest(
-                source_url=url,
-                final_url=response.final_url,
-                http_status=response.status,
-                content_type=response.content_type,
-                size_bytes=size_bytes,
-                sha256=sha256_hash,
-                role=role, # type: ignore
-                parent_document_id=parent_doc_id,
-                local_relative_path=str(target_path.relative_to(self.output_base_dir)),
+            return self._save_response(
+                url,
+                response,
+                target_path,
+                role,
+                parent_doc_id,
             )
         except Exception as e:
             logger.error(f"Dosya indirme hatası ({url}): {e}")
             raise
+
+    def _save_response(
+        self,
+        url: str,
+        response: BrowserResponse,
+        target_path: Path,
+        role: str,
+        parent_doc_id: Optional[str],
+    ) -> FileManifest:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(target_path, "wb") as f:
+            f.write(response.body)
+
+        return FileManifest(
+            source_url=url,
+            final_url=response.final_url,
+            http_status=response.status,
+            content_type=response.content_type,
+            size_bytes=target_path.stat().st_size,
+            sha256=compute_sha256(target_path),
+            role=role,  # type: ignore
+            parent_document_id=parent_doc_id,
+            local_relative_path=str(target_path.relative_to(self.output_base_dir)),
+        )
 
     def process_teblig_document(self, teblig_info: Dict[str, str], doc_index: int, rg_dir: Path) -> DocumentItem:
         """
@@ -230,60 +276,58 @@ class MevzuatFetcher:
         url = teblig_info["url"]
         title = teblig_info["title"]
 
-        # Determine file type
-        parsed_url = urlparse(url)
-        path_lower = parsed_url.path.lower()
-        is_pdf = path_lower.endswith(".pdf")
+        main_response = self.transport.fetch(url)
+        media_type = main_response.content_type.partition(";")[0].strip().lower()
+        is_pdf = (
+            urlparse(url).path.lower().endswith(".pdf")
+            or urlparse(main_response.final_url).path.lower().endswith(".pdf")
+            or media_type == "application/pdf"
+        )
         main_filename = "source.pdf" if is_pdf else "source.html"
         main_file_path = doc_dir / main_filename
 
-        main_manifest = self.download_file(
-            url=url,
-            target_path=main_file_path,
-            role="main_document",
-            parent_doc_id=doc_id,
+        main_manifest = self._save_response(
+            url,
+            main_response,
+            main_file_path,
+            "main_document",
+            doc_id,
         )
 
         attachments: List[FileManifest] = []
 
         # If it's HTML, search for attachments on the same domain
         if not is_pdf and main_file_path.exists():
-            try:
-                with open(main_file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    doc_soup = BeautifulSoup(f.read(), "html.parser")
+            doc_soup = BeautifulSoup(main_file_path.read_bytes(), "html.parser")
 
-                # Find all links and images
-                attachment_urls = set()
-                for tag in doc_soup.find_all(["a", "img", "embed", "iframe"]):
-                    href = tag.get("href") or tag.get("src")
-                    if not href:
-                        continue
-                    abs_url = urljoin(url, href)
-                    try:
-                        validate_official_url(abs_url)
-                    except UnsafeSourceUrl:
-                        continue
+            attachment_urls = set()
+            for tag in doc_soup.find_all(["a", "img", "embed", "iframe"]):
+                href = tag.get("href") or tag.get("src")
+                if not href:
+                    continue
+                abs_url = urljoin(url, href)
+                try:
+                    validate_official_url(abs_url)
+                except UnsafeSourceUrl:
+                    continue
 
-                    parsed_att = urlparse(abs_url)
-                    ext = Path(parsed_att.path).suffix.lower()
-                    if ext in ALLOWED_ATTACHMENT_EXTENSIONS and abs_url != url:
-                        attachment_urls.add(abs_url)
+                parsed_att = urlparse(abs_url)
+                ext = Path(parsed_att.path).suffix.lower()
+                if ext in ALLOWED_ATTACHMENT_EXTENSIONS and abs_url != url:
+                    attachment_urls.add(abs_url)
 
-                for att_url in sorted(attachment_urls):
-                    att_name = Path(urlparse(att_url).path).name
-                    if not att_name:
-                        att_name = f"attachment_{len(attachments)+1}.dat"
-                    att_path = doc_dir / att_name
+            used_names = {_filename_key(name) for name in _RESERVED_DOCUMENT_FILENAMES}
+            for att_url in sorted(attachment_urls):
+                att_name = _allocate_attachment_filename(att_url, used_names)
+                att_path = doc_dir / att_name
 
-                    att_manifest = self.download_file(
-                        url=att_url,
-                        target_path=att_path,
-                        role="attachment",
-                        parent_doc_id=doc_id,
-                    )
-                    attachments.append(att_manifest)
-            except Exception as e:
-                logger.warning(f"Ek ayrıştırma uyarısı ({doc_id}): {e}")
+                att_manifest = self.download_file(
+                    url=att_url,
+                    target_path=att_path,
+                    role="attachment",
+                    parent_doc_id=doc_id,
+                )
+                attachments.append(att_manifest)
 
         # Write doc manifest.json
         doc_manifest_path = doc_dir / "manifest.json"

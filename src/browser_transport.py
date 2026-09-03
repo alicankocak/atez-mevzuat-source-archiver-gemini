@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from ipaddress import ip_address
 from pathlib import PurePosixPath
@@ -14,7 +15,6 @@ from src.config import DEFAULT_USER_AGENT
 
 
 OFFICIAL_HOSTS = frozenset({"resmigazete.gov.tr", "www.resmigazete.gov.tr"})
-_BINARY_SUFFIXES = frozenset({".pdf", ".jpg", ".jpeg", ".png", ".gif"})
 _MAX_REDIRECTS = 10
 MAX_RESPONSE_BYTES = 50 * 1024 * 1024
 
@@ -103,6 +103,62 @@ def _expected_binary_kind(requested_url: str, response: BrowserResponse) -> str 
     return None
 
 
+def _validate_html_response(response: BrowserResponse) -> None:
+    media_type = _media_type(response.content_type)
+    if media_type not in {"text/html", "application/xhtml+xml"}:
+        raise InvalidSourceResponse(
+            f"Unexpected {response.content_type!r} content for an HTML source",
+            response=response,
+        )
+
+    sample = response.body[:128 * 1024]
+    if not sample.lstrip(b"\xef\xbb\xbf\x00\t\r\n ").startswith(b"<"):
+        raise InvalidSourceResponse(
+            f"HTML source does not contain markup: {response.final_url}",
+            response=response,
+        )
+
+    text = sample.decode("utf-8", errors="ignore").casefold()
+    title_match = re.search(r"<title\b[^>]*>(.*?)</title\s*>", text, re.DOTALL)
+    title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else ""
+    blocked_title_markers = (
+        "access denied",
+        "attention required",
+        "bakım",
+        "error",
+        "forbidden",
+        "giriş",
+        "hata",
+        "just a moment",
+        "login",
+        "maintenance",
+        "oturum aç",
+        "security check",
+        "service unavailable",
+        "sign in",
+        "unauthorized",
+    )
+    challenge_markers = (
+        "checking your browser",
+        "cf-chl-",
+        "captcha",
+        "verify you are human",
+    )
+    has_login_form = "<form" in text and any(
+        marker in text
+        for marker in ("type=password", 'type="password"', "name=password", "login")
+    )
+    if (
+        any(marker in title for marker in blocked_title_markers)
+        or any(marker in text for marker in challenge_markers)
+        or has_login_form
+    ):
+        raise InvalidSourceResponse(
+            f"Source returned an HTML error, login, or challenge page: {response.final_url}",
+            response=response,
+        )
+
+
 def validate_browser_response(
     requested_url: str,
     response: BrowserResponse,
@@ -141,6 +197,7 @@ def validate_browser_response(
     }
 
     if binary_kind is None:
+        _validate_html_response(response)
         return
     if media_type not in allowed_media_types[binary_kind]:
         raise InvalidSourceResponse(
@@ -214,13 +271,20 @@ class OfficialBrowserTransport:
                     context = browser.new_context(
                         user_agent=DEFAULT_USER_AGENT,
                         ignore_https_errors=True,
+                        java_script_enabled=False,
                         service_workers="block",
                     )
                     try:
-                        if PurePosixPath(urlparse(url).path).suffix.lower() in _BINARY_SUFFIXES:
-                            response = self._fetch_bytes(context, url)
-                        else:
-                            response = self._fetch_html(context, url)
+                        response = self._fetch_bytes(context, url)
+                        validate_browser_response(
+                            url,
+                            response,
+                            max_response_bytes=self._max_response_bytes,
+                        )
+                        if _expected_binary_kind(url, response) is not None:
+                            return response
+
+                        response = self._fetch_html(context, url, response)
                         validate_browser_response(
                             url,
                             response,
@@ -236,41 +300,54 @@ class OfficialBrowserTransport:
         except (PlaywrightTimeoutError, PlaywrightError) as exc:
             raise RetryableTransportError(f"Browser fetch failed for {url}: {exc}") from exc
 
-    def _fetch_html(self, context, url: str) -> BrowserResponse:
-        navigation_result: list[BrowserResponse] = []
-        navigation_errors: list[BrowserTransportError] = []
+    def _fetch_html(
+        self,
+        context,
+        url: str,
+        main_response: BrowserResponse,
+    ) -> BrowserResponse:
+        main_navigation_fulfilled = False
+        main_navigation_errors: list[BrowserTransportError] = []
+        page = context.new_page()
 
         def constrain_request(route) -> None:
+            nonlocal main_navigation_fulfilled
             request_url = route.request.url
+            is_requested_main_navigation = (
+                not main_navigation_fulfilled
+                and route.request.is_navigation_request()
+                and route.request.frame == page.main_frame
+            )
             try:
                 self._validate_url(request_url)
-                routed_response = self._fetch_routed_request(route, request_url)
-                if route.request.is_navigation_request():
-                    navigation_result.append(routed_response)
+                if is_requested_main_navigation:
+                    routed_response = main_response
+                    main_navigation_fulfilled = True
+                else:
+                    routed_response = self._fetch_routed_request(route, request_url)
                 route.fulfill(
                     status=routed_response.status,
                     content_type=routed_response.content_type,
                     body=routed_response.body,
                 )
             except BrowserTransportError as exc:
-                if route.request.is_navigation_request():
-                    navigation_errors.append(exc)
+                if is_requested_main_navigation:
+                    main_navigation_errors.append(exc)
                 route.abort()
 
         context.route("**/*", constrain_request)
-        page = context.new_page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=self._timeout_ms)
         except (PlaywrightTimeoutError, PlaywrightError) as exc:
-            if navigation_errors:
-                raise navigation_errors[-1] from exc
+            if main_navigation_errors:
+                raise main_navigation_errors[-1] from exc
             raise
 
-        if navigation_errors:
-            raise navigation_errors[-1]
-        if not navigation_result:
+        if main_navigation_errors:
+            raise main_navigation_errors[-1]
+        if not main_navigation_fulfilled:
             raise RetryableTransportError(f"Browser returned no response for {url}")
-        return navigation_result[-1]
+        return main_response
 
     def _fetch_routed_request(self, route, url: str) -> BrowserResponse:
         current_url = url
