@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -60,7 +61,10 @@ class FakeDriveService:
         return self._files
 
     def list_files(self, query):
-        if "name contains 'PROCESSING_'" in query:
+        if (
+            "name contains 'PROCESSING_'" in query
+            and "not name contains 'PROCESSING_'" not in query
+        ):
             return self.processing_files
         if "name = '2026-08-14'" in query:
             return [{"id": "date-id", "name": "2026-08-14"}] if self.ready_enabled else []
@@ -109,10 +113,12 @@ def drive():
 
 
 @pytest.fixture
-def watcher(monkeypatch, drive):
+def watcher(monkeypatch, drive, tmp_path):
     uploader = FakeUploader(drive)
     monkeypatch.setattr(drive_watcher_module, "DriveUploader", lambda: uploader)
-    return DriveRequestWatcher(check_interval_seconds=0)
+    instance = DriveRequestWatcher(check_interval_seconds=0)
+    instance.claim_lock_dir = tmp_path
+    return instance
 
 
 @pytest.fixture
@@ -165,6 +171,14 @@ def test_request_parses_utf8_json_bytes():
     assert request.requested_at.utcoffset().total_seconds() == 0
 
 
+def test_request_accepts_explicit_rfc3339_utc_offset():
+    payload = dict(REQUEST_PAYLOAD, requested_at="2026-09-03T00:00:00+00:00")
+
+    request = SourceRequest.model_validate(payload)
+
+    assert request.requested_at.utcoffset().total_seconds() == 0
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -173,6 +187,9 @@ def test_request_parses_utf8_json_bytes():
         ("report_date", "14.08.2026"),
         ("requested_at", "2026-09-03T00:00:00"),
         ("requested_at", "2026-09-03T03:00:00+03:00"),
+        ("requested_at", 0),
+        ("request_id", "a"),
+        ("request_id", "req-" + "a" * 129),
         ("requested_by", "another-client"),
     ],
 )
@@ -216,7 +233,11 @@ def test_failure_records_error_and_does_not_reenter_pending(
     assert result["error"] == "network unavailable"
 
     watcher.list_pending_requests()
-    pending_query = drive.queries[-1]
+    pending_query = next(
+        query
+        for query in drive.queries
+        if "not name contains 'PROCESSING_'" in query
+    )
     assert "not name contains 'PROCESSING_'" in pending_query
     assert "not name contains 'DONE_'" in pending_query
     assert "not name contains 'FAILED_'" in pending_query
@@ -230,8 +251,13 @@ def test_processing_same_date_leaves_second_request_pending(
         {
             "id": "other-file",
             "name": "PROCESSING_SOURCE_REQUEST__2026-08-14__other.json",
+            "appProperties": {
+                "claimed_at": datetime.now(timezone.utc).isoformat()
+            },
         }
     ]
+    other_payload = dict(REQUEST_PAYLOAD, request_id="req-456")
+    drive.media["other-file"] = json.dumps(other_payload).encode("utf-8")
 
     class UnexpectedFetcher:
         def __init__(self, **kwargs):
@@ -296,6 +322,9 @@ def test_process_uses_request_bytes_and_claims_before_fetch(
 
     event_names = [event[0] for event in drive.events]
     assert event_names.index("update") < event_names.index("fetch")
+    claimed_name = drive.updates[0]["body"]["name"]
+    assert "2026-08-14" in claimed_name
+    assert "2099-01-01" not in claimed_name
     assert json.loads(drive.updates[-1]["media"])["status"] == "DONE"
 
 
@@ -317,3 +346,94 @@ def test_invalid_request_is_failed_without_date_inference(
     result = json.loads(drive.updates[-1]["media"])
     assert result["status"] == "FAILED"
     assert "INVALID_REQUEST" in result["error"]
+
+
+def test_incomplete_ready_gate_does_not_skip_collection(
+    monkeypatch, watcher, drive, pending_file, tmp_path
+):
+    drive.media["file-1"] = json.dumps(REQUEST_PAYLOAD).encode("utf-8")
+    drive.ready_enabled = True
+    drive.media["ready-1"] = json.dumps(
+        {"report_date": "2026-08-14", "total_files_count": 0}
+    ).encode("utf-8")
+    fetch_count = 0
+
+    class FakeFetcher:
+        def __init__(self, date_str):
+            assert date_str == "2026-08-14"
+
+        def run(self):
+            nonlocal fetch_count
+            fetch_count += 1
+            manifest = SimpleNamespace(resmi_gazete_sayisi="33299")
+            return manifest, Path(tmp_path) / "rg-33299"
+
+    monkeypatch.setattr(drive_watcher_module, "MevzuatFetcher", FakeFetcher)
+
+    watcher.process_request(pending_file)
+
+    assert fetch_count == 1
+    assert json.loads(drive.updates[-1]["media"])["status"] == "DONE"
+
+
+def test_stale_processing_claim_returns_to_pending(watcher, drive):
+    stale_file = {
+        "id": "stale-file",
+        "name": "PROCESSING_SOURCE_REQUEST__2099-01-01__wrong.json",
+        "appProperties": {"claimed_at": "2000-01-01T00:00:00Z"},
+    }
+    drive.processing_files = [stale_file]
+    drive.media["stale-file"] = json.dumps(REQUEST_PAYLOAD).encode("utf-8")
+
+    pending = watcher.list_pending_requests()
+
+    assert pending == [
+        {
+            "id": "stale-file",
+            "name": "SOURCE_REQUEST__2026-08-14__req-123.json",
+        }
+    ]
+    assert drive.updates[-1]["body"]["name"] == pending[0]["name"]
+
+
+def test_same_mac_watchers_cannot_collect_same_date_concurrently(
+    monkeypatch, watcher, drive, tmp_path
+):
+    second_watcher = DriveRequestWatcher(check_interval_seconds=0)
+    second_watcher.claim_lock_dir = watcher.claim_lock_dir
+    first_file = {
+        "id": "file-1",
+        "name": "SOURCE_REQUEST__2026-08-14__req-123.json",
+    }
+    second_file = {
+        "id": "file-2",
+        "name": "SOURCE_REQUEST__2099-01-01__req-456.json",
+    }
+    drive.media["file-1"] = json.dumps(REQUEST_PAYLOAD).encode("utf-8")
+    second_payload = dict(REQUEST_PAYLOAD, request_id="req-456")
+    drive.media["file-2"] = json.dumps(second_payload).encode("utf-8")
+    fetch_count = 0
+
+    class ReentrantFetcher:
+        def __init__(self, date_str):
+            assert date_str == "2026-08-14"
+
+        def run(self):
+            nonlocal fetch_count
+            fetch_count += 1
+            if fetch_count == 1:
+                second_watcher.process_request(second_file)
+            manifest = SimpleNamespace(resmi_gazete_sayisi="33299")
+            return manifest, Path(tmp_path) / "rg-33299"
+
+    monkeypatch.setattr(drive_watcher_module, "MevzuatFetcher", ReentrantFetcher)
+
+    watcher.process_request(first_file)
+
+    assert fetch_count == 1
+    processing_updates = [
+        update
+        for update in drive.updates
+        if update["body"].get("name", "").startswith("PROCESSING_")
+    ]
+    assert [update["file_id"] for update in processing_updates] == ["file-1"]

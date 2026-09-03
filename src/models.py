@@ -9,7 +9,14 @@ class SourceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     schema_version: Literal[1]
-    request_id: str = Field(min_length=1, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    request_id: str = Field(
+        min_length=7,
+        max_length=128,
+        pattern=(
+            r"^(?:req-[A-Za-z0-9][A-Za-z0-9._-]{2,63}|"
+            r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})$"
+        ),
+    )
     report_date: date
     requested_at: AwareDatetime
     requested_by: Literal["atez-mevzuar-rapor-alcn"]
@@ -28,6 +35,17 @@ class SourceRequest(BaseModel):
     def require_utc_requested_at(cls, value: datetime) -> datetime:
         if value.utcoffset() != timedelta(0):
             raise ValueError("requested_at must be timezone-aware UTC")
+        return value
+
+    @field_validator("requested_at", mode="before")
+    @classmethod
+    def require_rfc3339_requested_at(cls, value):
+        if not isinstance(value, str) or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+            r"(?:Z|[+-]\d{2}:\d{2})",
+            value,
+        ):
+            raise ValueError("requested_at must be an RFC3339 UTC string")
         return value
 
 
