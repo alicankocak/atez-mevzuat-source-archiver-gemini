@@ -91,6 +91,13 @@ class SourceManifest(BaseModel):
     documents: List[DocumentItem] = Field(default_factory=list)
 
 
+class ReadyFile(BaseModel):
+    relative_path: str
+    drive_file_id: str
+    size_bytes: int
+    sha256: str
+
+
 class ReadyGate(BaseModel):
     schema_version: int = 1
     status: Literal["READY", "FAILED"] = "READY"
@@ -99,3 +106,4 @@ class ReadyGate(BaseModel):
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     total_files_count: int
     verified: bool = True
+    files: List[ReadyFile] = Field(default_factory=list)

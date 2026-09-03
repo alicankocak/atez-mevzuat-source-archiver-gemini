@@ -14,9 +14,13 @@ from src.config import (
     DRIVE_ROOT_FOLDER_NAME,
     SUBFOLDERS,
 )
-from src.models import ReadyGate
+from src.models import ReadyFile, ReadyGate
 
 logger = logging.getLogger("atez.drive")
+
+
+class DriveVerificationError(RuntimeError):
+    pass
 
 
 class DriveUploader:
@@ -159,47 +163,60 @@ class DriveUploader:
 
         return True
 
-    def upload_rg_source_tree(self, local_rg_dir: Path, sources_folder_id: str) -> bool:
+    def upload_rg_source_tree(
+        self, local_rg_dir: Path, sources_folder_id: str
+    ) -> tuple[ReadyGate, str]:
         """
         Recursively uploads local rg directory to Drive sources/ folder.
         Verifies all uploaded files.
         Writes _READY.json upon full success.
         """
         if not self.service:
-            logger.info("Drive servisi aktif değil, yükleme atlandı.")
-            return False
+            raise RuntimeError("Drive servisi bağlı değil.")
 
         rg_folder_name = local_rg_dir.name
         drive_rg_folder_id = self.find_or_create_folder(rg_folder_name, sources_folder_id)
 
-        uploaded_files: List[Tuple[Path, str]] = [] # (local_path, drive_file_id)
+        uploaded_files: List[Tuple[Path, Path, str]] = []
 
         # 1. Upload all items in rg directory
-        for item in local_rg_dir.iterdir():
-            if item.is_file():
-                if item.name == "_READY.json":
-                    continue
-                file_id, _ = self.upload_file(item, drive_rg_folder_id)
-                uploaded_files.append((item, file_id))
-            elif item.is_dir():
-                sub_drive_id = self.find_or_create_folder(item.name, drive_rg_folder_id)
-                for sub_item in item.iterdir():
-                    if sub_item.is_file():
-                        sub_file_id, _ = self.upload_file(sub_item, sub_drive_id)
-                        uploaded_files.append((sub_item, sub_file_id))
+        def upload_directory(local_dir: Path, drive_folder_id: str) -> None:
+            for item in sorted(local_dir.iterdir(), key=lambda path: path.name):
+                if item.is_file():
+                    if item.name == "_READY.json":
+                        continue
+                    file_id, _ = self.upload_file(item, drive_folder_id)
+                    uploaded_files.append(
+                        (item, item.relative_to(local_rg_dir), file_id)
+                    )
+                elif item.is_dir():
+                    sub_drive_id = self.find_or_create_folder(
+                        item.name, drive_folder_id
+                    )
+                    upload_directory(item, sub_drive_id)
+
+        upload_directory(local_rg_dir, drive_rg_folder_id)
 
         # 2. Verify all files
         logger.info(f"Toplam {len(uploaded_files)} dosya Drive üzerinde doğrulanıyor...")
-        for local_file, drive_id in uploaded_files:
-            hasher = hashlib.sha256()
-            with open(local_file, "rb") as f:
-                content = f.read()
-                hasher.update(content)
-            expected_hash = hasher.hexdigest()
+        ready_files = []
+        for local_file, relative_path, drive_id in uploaded_files:
+            content = local_file.read_bytes()
+            expected_hash = hashlib.sha256(content).hexdigest()
             expected_size = len(content)
 
             if not self.verify_file_hash(drive_id, expected_hash, expected_size):
-                raise RuntimeError(f"DRIVE_WRITE_FAILED: {local_file.name} doğrulaması başarısız oldu.")
+                raise DriveVerificationError(
+                    f"DRIVE_WRITE_FAILED: {relative_path.as_posix()} doğrulaması başarısız oldu."
+                )
+            ready_files.append(
+                ReadyFile(
+                    relative_path=relative_path.as_posix(),
+                    drive_file_id=drive_id,
+                    size_bytes=expected_size,
+                    sha256=expected_hash,
+                )
+            )
 
         logger.info("Tüm dosyalar SHA-256 ve boyut yönünden doğrulandı.")
 
@@ -210,11 +227,12 @@ class DriveUploader:
             resmi_gazete_sayisi=rg_folder_name.replace("rg-", ""),
             total_files_count=len(uploaded_files),
             verified=True,
+            files=ready_files,
         )
         ready_path = local_rg_dir / "_READY.json"
         with open(ready_path, "w", encoding="utf-8") as f:
             f.write(ready_gate.model_dump_json(indent=2))
 
-        self.upload_file(ready_path, drive_rg_folder_id)
+        ready_file_id, _ = self.upload_file(ready_path, drive_rg_folder_id)
         logger.info(f"_READY.json başarıyla oluşturuldu ve yüklendi: {ready_path}")
-        return True
+        return ready_gate, ready_file_id
