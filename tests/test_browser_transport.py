@@ -291,6 +291,43 @@ def test_rejects_http_200_html_structural_error_or_login_page(body):
 
 
 @pytest.mark.parametrize(
+    "body",
+    [
+        (
+            "<!doctype html><title>Resmî Gazete</title>"
+            "<main><h1>Sayfa bulunamadı</h1></main>"
+        ).encode("utf-8"),
+        b"<!doctype html><title>404 Not Found</title><main></main>",
+    ],
+)
+def test_rejects_http_200_explicit_not_found_title_or_heading(body):
+    url = "https://resmigazete.gov.tr/document.html"
+    response = BrowserResponse(200, url, "text/html; charset=utf-8", body)
+
+    with pytest.raises(InvalidSourceResponse):
+        validate_browser_response(url, response)
+
+
+def test_accepts_gazette_prose_that_mentions_unauthorized_access():
+    url = "https://resmigazete.gov.tr/document.html"
+    body = (
+        "<!doctype html>"
+        "<title>Bilgi Güvenliği Tedbirleri Hakkında Tebliğ</title>"
+        "<article>"
+        "<h1>Bilgi Güvenliği Tedbirleri Hakkında Tebliğ</h1>"
+        "<p>Bu Tebliğin amacı bilgi sistemlerinin güvenli işletilmesine ilişkin "
+        "usul ve esasları düzenlemektir.</p>"
+        "<p>Kurumlar, verileri yetkisiz erişimlere karşı korumak ve işlem kayıtlarını "
+        "saklamak için gerekli idari ve teknik tedbirleri uygular.</p>"
+        "<p>Yetkilendirme kayıtları düzenli olarak incelenir ve sonuçlar raporlanır.</p>"
+        "</article>"
+    ).encode("utf-8")
+    response = BrowserResponse(200, url, "text/html; charset=utf-8", body)
+
+    validate_browser_response(url, response)
+
+
+@pytest.mark.parametrize(
     "title",
     [
         "Bakım Usul ve Esasları Hakkında Tebliğ",

@@ -125,17 +125,35 @@ def _validate_html_response(response: BrowserResponse) -> None:
         return re.sub(r"\s+", " ", value).strip().casefold()
 
     title = normalized_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
-    blocked_title_phrases = (
+    explicit_error_phrases = (
         "access denied",
+        "access forbidden",
         "attention required",
+        "belge bulunamadı",
+        "erişim engellendi",
+        "erişim reddedildi",
+        "içerik bulunamadı",
         "internal server error",
         "just a moment",
+        "not found",
         "oturum aç",
+        "page not found",
+        "permission denied",
+        "request blocked",
+        "sayfa bulunamadı",
         "security check",
         "service unavailable",
         "sign in",
     )
-    blocked_title_values = {"forbidden", "login", "maintenance", "unauthorized"}
+    explicit_error_values = {
+        "404",
+        "error",
+        "forbidden",
+        "hata",
+        "login",
+        "maintenance",
+        "unauthorized",
+    }
     challenge_markers = (
         "checking your browser",
         "cf-chl-",
@@ -144,39 +162,36 @@ def _validate_html_response(response: BrowserResponse) -> None:
     )
     body_text = normalized_text(soup.get_text(" ", strip=True))
     markup = str(soup).casefold()
-    strong_body_error_phrases = (
-        "access denied",
-        "access forbidden",
-        "internal server error",
-        "permission denied",
-        "request blocked",
-        "service unavailable",
-        "erişim engellendi",
-        "erişim reddedildi",
-        "yetkisiz erişim",
+    primary_heading = soup.find("h1")
+    heading_text = (
+        normalized_text(primary_heading.get_text(" ", strip=True))
+        if primary_heading
+        else ""
     )
-    generic_error_values = {"error", "forbidden", "hata", "unauthorized"}
-    error_elements = soup.find_all(["h1", "h2", "h3"])
-    error_elements.extend(soup.find_all(attrs={"role": "alert"}))
-    has_structural_error = False
-    for element in error_elements:
-        element_text = normalized_text(element.get_text(" ", strip=True))
-        if (
-            any(marker in element_text for marker in strong_body_error_phrases)
-            or element_text.strip(" .:;!|-") in generic_error_values
-        ):
-            has_structural_error = True
-            break
+    page_level_texts = (title, heading_text)
+    has_page_level_error = any(
+        any(marker in text for marker in explicit_error_phrases)
+        or text.strip(" .:;!|-") in explicit_error_values
+        for text in page_level_texts
+    )
+
+    content_blocks = soup.find_all(["p", "li", "tr"])
+    is_short_low_content = len(body_text) <= 500 and len(content_blocks) <= 2
+    has_short_error_shell = is_short_low_content and (
+        any(marker in body_text for marker in explicit_error_phrases)
+        or any(marker in body_text or marker in markup for marker in challenge_markers)
+    )
 
     has_password_input = any(
         str(field.get("type", "")).strip().casefold() == "password"
         for field in soup.find_all("input")
     )
-    login_form_pattern = re.compile(
-        r"login|log[-_ ]?in|sign[-_ ]?in|giriş|giris|oturum",
+    error_form_pattern = re.compile(
+        r"captcha|challenge|denied|error|forbidden|login|log[-_ ]?in|"
+        r"sign[-_ ]?in|giriş|giris|oturum",
         re.IGNORECASE,
     )
-    has_login_form = False
+    has_error_form = False
     for form in soup.find_all("form"):
         attribute_text = " ".join(
             " ".join(value) if isinstance(value, list) else str(value)
@@ -184,20 +199,17 @@ def _validate_html_response(response: BrowserResponse) -> None:
             if name in {"action", "class", "id", "name"}
         )
         form_text = normalized_text(form.get_text(" ", strip=True))
-        if login_form_pattern.search(attribute_text) or any(
+        if error_form_pattern.search(attribute_text) or any(
             phrase in form_text for phrase in ("sign in", "giriş yap", "oturum aç")
         ):
-            has_login_form = True
+            has_error_form = True
             break
 
     if (
-        any(marker in title for marker in blocked_title_phrases)
-        or title.strip(" .:;!|-") in blocked_title_values
-        or any(marker in body_text or marker in markup for marker in challenge_markers)
-        or any(marker in body_text for marker in strong_body_error_phrases)
-        or has_structural_error
+        has_page_level_error
+        or has_short_error_shell
         or has_password_input
-        or has_login_form
+        or has_error_form
     ):
         raise InvalidSourceResponse(
             f"Source returned an HTML error, login, or challenge page: {response.final_url}",
