@@ -34,7 +34,7 @@ değiştiremez.
     Hata alias'ı: https://www.resmigazete.gov.tr/DD.MM.YYYY
 
     GitHub deposu: alicankocak/atez-mevzuat-source-archiver-gemini
-    Drive kökü: ATEZ-Mevzuat-Radari-Gemini
+    Drive kökü: ATEZ-Gemini-Mevzuat-Radari
     Drive kök kimliği: 1xrSozns-2sMBJRUuY3JvglVdSnKX1hDc
     Gmail gönderici: atezmevzuat@gmail.com
 
@@ -55,7 +55,7 @@ gövdesine, manifestlere veya Drive dosyalarına yazılmaz.
 
 Tüm veriler tarih merkezlidir. Tarih biçimi zorunlu olarak YYYY-MM-DDdir.
 
-    ATEZ-Mevzuat-Radari-V2/
+    ATEZ-Gemini-Mevzuat-Radari/
     └── YYYY-MM-DD/
         ├── requests/
         │   └── Ayrılmış alan; AI buraya PENDING/talep dosyası yazmaz.
