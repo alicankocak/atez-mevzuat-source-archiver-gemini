@@ -346,6 +346,7 @@ class DriveRequestWatcher:
                         "created_at",
                         "total_files_count",
                         "verified",
+                        "files",
                     }
                     created_at = raw_gate.get("created_at")
                     if (
@@ -383,17 +384,6 @@ class DriveRequestWatcher:
                     )
                     return rg_number, ready_file["id"]
         return None
-
-    def _adapt_upload_result(self, report_date: str, upload_result) -> Tuple[str, str]:
-        """Bridge the current boolean uploader until it returns the Task 3 tuple."""
-        if isinstance(upload_result, tuple) and len(upload_result) == 2:
-            gate, ready_file_id = upload_result
-            return gate.resmi_gazete_sayisi, ready_file_id
-        if upload_result is True:
-            ready_result = self._find_ready_result(report_date)
-            if ready_result:
-                return ready_result
-        raise RuntimeError("DRIVE_WRITE_FAILED: geçerli READY kapısı bulunamadı")
 
     def process_request(self, file_info: Dict) -> None:
         file_id = file_info["id"]
@@ -449,12 +439,14 @@ class DriveRequestWatcher:
             _, rg_dir = fetcher.run()
 
             folder_ids = self.uploader.ensure_date_hierarchy(target_date)
-            upload_result = self.uploader.upload_rg_source_tree(
+            gate, ready_file_id = self.uploader.upload_rg_source_tree(
                 rg_dir, folder_ids["sources"]
             )
-            rg_number, ready_file_id = self._adapt_upload_result(
-                target_date, upload_result
-            )
+            rg_number = gate.resmi_gazete_sayisi
+            if not rg_number or not ready_file_id:
+                raise RuntimeError(
+                    "DRIVE_WRITE_FAILED: yükleyici geçerli READY sonucu döndürmedi"
+                )
 
             self.complete_request(
                 file_id,

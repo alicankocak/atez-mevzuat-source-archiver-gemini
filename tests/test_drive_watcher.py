@@ -8,7 +8,7 @@ from pydantic import ValidationError
 
 import src.drive_watcher as drive_watcher_module
 from src.drive_watcher import DriveRequestWatcher
-from src.models import SourceRequest
+from src.models import ReadyGate, SourceRequest
 
 
 REQUEST_PAYLOAD = {
@@ -18,6 +18,28 @@ REQUEST_PAYLOAD = {
     "requested_at": "2026-09-03T00:00:00Z",
     "requested_by": "atez-mevzuar-rapor-alcn",
 }
+
+READY_FILE = {
+    "relative_path": "index.html",
+    "drive_file_id": "source-1",
+    "size_bytes": 13,
+    "sha256": "a" * 64,
+}
+
+
+def ready_payload(**overrides):
+    payload = {
+        "schema_version": 1,
+        "status": "READY",
+        "report_date": "2026-08-14",
+        "resmi_gazete_sayisi": "33299",
+        "created_at": "2026-09-03T00:00:00Z",
+        "total_files_count": 1,
+        "verified": True,
+        "files": [READY_FILE],
+    }
+    payload.update(overrides)
+    return payload
 
 
 class FakeCall:
@@ -93,18 +115,9 @@ class FakeUploader:
     def upload_rg_source_tree(self, rg_dir, sources_folder_id):
         self.drive.events.append(("upload", str(rg_dir)))
         self.drive.ready_enabled = True
-        self.drive.media["ready-1"] = json.dumps(
-            {
-                "schema_version": 1,
-                "status": "READY",
-                "report_date": "2026-08-14",
-                "resmi_gazete_sayisi": "33299",
-                "created_at": "2026-09-03T00:00:00Z",
-                "total_files_count": 3,
-                "verified": True,
-            }
-        ).encode("utf-8")
-        return True
+        gate = ReadyGate.model_validate(ready_payload())
+        self.drive.media["ready-1"] = gate.model_dump_json().encode("utf-8")
+        return gate, "ready-1"
 
 
 @pytest.fixture
@@ -275,17 +288,7 @@ def test_existing_ready_gate_is_reused_without_collecting(
 ):
     drive.media["file-1"] = json.dumps(REQUEST_PAYLOAD).encode("utf-8")
     drive.ready_enabled = True
-    drive.media["ready-1"] = json.dumps(
-        {
-            "schema_version": 1,
-            "status": "READY",
-            "report_date": "2026-08-14",
-            "resmi_gazete_sayisi": "33299",
-            "created_at": "2026-09-03T00:00:00Z",
-            "total_files_count": 3,
-            "verified": True,
-        }
-    ).encode("utf-8")
+    drive.media["ready-1"] = json.dumps(ready_payload()).encode("utf-8")
 
     class UnexpectedFetcher:
         def __init__(self, **kwargs):
@@ -374,6 +377,62 @@ def test_incomplete_ready_gate_does_not_skip_collection(
 
     assert fetch_count == 1
     assert json.loads(drive.updates[-1]["media"])["status"] == "DONE"
+
+
+def test_count_only_legacy_ready_gate_is_rejected(watcher, drive):
+    drive.ready_enabled = True
+    legacy_gate = ready_payload()
+    legacy_gate.pop("files")
+    drive.media["ready-1"] = json.dumps(legacy_gate).encode("utf-8")
+
+    assert watcher._find_ready_result("2026-08-14") is None
+
+
+@pytest.mark.parametrize(
+    "files,total_files_count",
+    [
+        ([READY_FILE], 2),
+        ([dict(READY_FILE, drive_file_id="")], 1),
+        ([dict(READY_FILE, size_bytes=-1)], 1),
+        ([dict(READY_FILE, sha256="not-a-sha256")], 1),
+    ],
+)
+def test_malformed_file_complete_ready_gate_is_rejected(
+    watcher, drive, files, total_files_count
+):
+    drive.ready_enabled = True
+    drive.media["ready-1"] = json.dumps(
+        ready_payload(files=files, total_files_count=total_files_count)
+    ).encode("utf-8")
+
+    assert watcher._find_ready_result("2026-08-14") is None
+
+
+def test_boolean_upload_result_fails_request(
+    monkeypatch, watcher, drive, pending_file, tmp_path
+):
+    drive.media["file-1"] = json.dumps(REQUEST_PAYLOAD).encode("utf-8")
+
+    class FakeFetcher:
+        def __init__(self, date_str):
+            assert date_str == "2026-08-14"
+
+        def run(self):
+            return SimpleNamespace(resmi_gazete_sayisi="33299"), tmp_path / "rg-33299"
+
+    monkeypatch.setattr(drive_watcher_module, "MevzuatFetcher", FakeFetcher)
+    drive.media["ready-1"] = json.dumps(ready_payload()).encode("utf-8")
+
+    def boolean_upload(*_args):
+        drive.ready_enabled = True
+        return True
+
+    watcher.uploader.upload_rg_source_tree = boolean_upload
+
+    watcher.process_request(pending_file)
+
+    result = json.loads(drive.updates[-1]["media"])
+    assert result["status"] == "FAILED"
 
 
 def test_stale_processing_claim_returns_to_pending(watcher, drive):

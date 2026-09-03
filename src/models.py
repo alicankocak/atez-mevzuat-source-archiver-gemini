@@ -2,7 +2,14 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 class SourceRequest(BaseModel):
@@ -92,18 +99,41 @@ class SourceManifest(BaseModel):
 
 
 class ReadyFile(BaseModel):
-    relative_path: str
-    drive_file_id: str
-    size_bytes: int
-    sha256: str
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    relative_path: str = Field(min_length=1)
+    drive_file_id: str = Field(min_length=1)
+    size_bytes: int = Field(ge=0, strict=True)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("relative_path")
+    @classmethod
+    def require_safe_relative_path(cls, value: str) -> str:
+        path = value.replace("\\", "/")
+        if path.startswith("/") or any(part in {"", ".", ".."} for part in path.split("/")):
+            raise ValueError("relative_path must be a normalized relative path")
+        return path
 
 
 class ReadyGate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     schema_version: int = 1
     status: Literal["READY", "FAILED"] = "READY"
     report_date: str # YYYY-MM-DD
     resmi_gazete_sayisi: Optional[str] = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    total_files_count: int
+    total_files_count: int = Field(ge=0, strict=True)
     verified: bool = True
-    files: List[ReadyFile] = Field(default_factory=list)
+    files: List[ReadyFile]
+
+    @model_validator(mode="after")
+    def require_complete_inventory(self):
+        if self.total_files_count != len(self.files):
+            raise ValueError("total_files_count must equal len(files)")
+        if self.status == "READY" and not self.files:
+            raise ValueError("READY gate files must not be empty")
+        relative_paths = [item.relative_path for item in self.files]
+        if len(relative_paths) != len(set(relative_paths)):
+            raise ValueError("READY gate file paths must be unique")
+        return self
