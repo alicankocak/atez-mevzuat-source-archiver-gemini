@@ -31,13 +31,26 @@ Kullanıcı senden "raporu gönder", "test1 grubuna gönder" veya "şu maile gö
 # Kaynak Okuma ve Otomatik Arşivleme
 1. Tüm veriler tarih merkezlidir (YYYY-MM-DD).
 2. Analiz yapmadan önce hedef tarihin `ATEZ-Gemini-Mevzuat-Radari/YYYY-MM-DD/sources/rg-<sayi>/_READY.json` dosyasını kontrol et.
-3. `_READY.json` varsa doğrudan analize başla.
-4. `_READY.json` yoksa Drive kök `requests/` klasörünü kontrol et. Aynı tarih için geçerli bir READY kaydı veya aşağıdaki adlardan biri varsa yinelenen talep oluşturma:
+3. `_READY.json` yalnız aşağıdaki alanların tamamı doğrulanırsa geçerlidir:
+   - `schema_version: 1`, `status: "READY"`, hedef tarihle aynı `report_date`, klasördeki `rg-<sayi>` ile aynı ve boş olmayan `resmi_gazete_sayisi`, geçerli RFC 3339 `created_at` ve `verified: true`.
+   - Kapı boş olmayan `files[]` içermeli; `total_files_count` değeri `files[]` uzunluğuna eşit olmalıdır. Her kayıtta benzersiz, normalleştirilmiş `relative_path`, boş olmayan `drive_file_id`, negatif olmayan tam sayı `size_bytes` ve 64 karakterli küçük harf onaltılık `sha256` bulunmalıdır.
+4. Analizden önce bütün `files[]` kayıtlarını tek tek doğrula:
+   - Her `drive_file_id` gerçekten aynı `rg-*` ağacı altında bulunmalı ve Drive ağacındaki göreli yolu kayıttaki `relative_path` ile birebir eşleşmelidir. Yalnız dosya adına bakarak eşleştirme yapma.
+   - Her dosyayı ham bayt olarak indir; ham bayt boyutu tam olarak `size_bytes` olmalı ve hesaplanan SHA-256 tam olarak `sha256` ile eşleşmelidir.
+   - Bağlayıcının `content` alanı boş olduğunda dosyayı boş kabul etme; `file_uri` üzerinden ham baytları indir, bu yol kullanılamıyorsa yalnız desteklenen uyumluluk yanıtındaki base64 baytlarını çöz.
+   - Kapı, yol, Drive kimliği, boyut veya hash uyuşmazlığında `SOURCE_INTEGRITY_ERROR` bildir; o kaynak setinden analiz, rapor veya e-posta üretme.
+5. Bütünlük doğrulaması bütünüyle tamamlandıktan sonra doğrulanmış `source-manifest.json` dosyasını aç. Gemini `documents` yapısını eksiksiz dolaş: her `documents[*].main_document` ve her `documents[*].attachments[]` kaydını işle; kayıtların `local_relative_path`, rol, üst belge kimliği, boyut ve SHA-256 değerlerini doğrulanmış READY envanteriyle bağla.
+6. Doğrulanmış ham kaynakları şu sırayla çıkar:
+   - HTML için ham baytların karakter kodlamasını belirle; HTML'i DOM olarak ayrıştır ve metinle birlikte tabloları da koru.
+   - PDF metin katmanını önce çıkar; katman yoksa, boşsa veya yetersizse sayfaları görüntüleyip sayfa OCR uygula.
+   - Metin taşıyan GIF/JPG/JPEG/PNG eklerine OCR uygula.
+   - Bir dosyanın bütünlüğü doğru olduğu hâlde araç veya biçim nedeniyle içerik çıkarılamazsa yalnız ilgili belgeyi `SOURCE_EXTRACTION_BLOCKED` olarak işaretle. Bunu `SOURCE_INTEGRITY_ERROR` sayma; kalan doğrulanmış belgeleri işlemeye devam et ve eksikliği raporda açıkla.
+7. Geçerli `_READY.json` yoksa Drive kök `requests/` klasörünü kontrol et. Aynı tarih için geçerli bir READY kaydı veya aşağıdaki adlardan biri varsa yinelenen talep oluşturma:
    - `SOURCE_REQUEST__YYYY-MM-DD__<uuid>.json`
    - `PROCESSING_SOURCE_REQUEST__YYYY-MM-DD__<uuid>.json`
    - `DONE_SOURCE_REQUEST__YYYY-MM-DD__<uuid>.json`
-5. Bu kayıtların hiçbiri yoksa Drive kök `requests/` klasörüne tam olarak `SOURCE_REQUEST__YYYY-MM-DD__<uuid>.json` adıyla, `application/json` türünde tek bir talep yükle. `<uuid>` yeni bir RFC 4122 UUID olmalıdır.
-6. Talep UTF-8 kodlu katı JSON olmalı; aşağıdaki beş alan dışında hiçbir alan içermemelidir:
+8. Bu kayıtların hiçbiri yoksa Drive kök `requests/` klasörüne tam olarak `SOURCE_REQUEST__YYYY-MM-DD__<uuid>.json` adıyla, `application/json` türünde tek bir talep yükle. `<uuid>` yeni bir RFC 4122 UUID olmalıdır.
+9. Talep UTF-8 kodlu katı JSON olmalı; aşağıdaki beş alan dışında hiçbir alan içermemelidir:
 
 ```json
 {
@@ -49,7 +62,7 @@ Kullanıcı senden "raporu gönder", "test1 grubuna gönder" veya "şu maile gö
 }
 ```
 
-7. Talep `PROCESSING_` öneki aldığında watcher tarafından sahiplenilmiştir; bu durumda yeni talep oluşturma. `DONE_` sonucunu ve ardından tarih klasöründeki geçerli `_READY.json` dosyasını bekle. Kullanıcıya kaynakların arka planda indirildiğini ve hazır olduklarında analizin devam edeceğini bildir.
+10. Talep `PROCESSING_` öneki aldığında watcher tarafından sahiplenilmiştir; bu durumda yeni talep oluşturma. `DONE_` sonucunu ve ardından tarih klasöründeki yukarıdaki bütünlük adımlarından geçen `_READY.json` dosyasını bekle. Kullanıcıya kaynakların arka planda indirildiğini ve hazır olduklarında analizin devam edeceğini bildir.
 
 # Sohbette Kullanılacak Standart Yanıt Formatı
 

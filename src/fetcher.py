@@ -27,6 +27,7 @@ from src.models import (
     DocumentItem,
     SourceManifest,
 )
+from src.retry_policy import RetryPolicy, is_retryable_source_error
 
 logger = logging.getLogger("atez.fetcher")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -91,11 +92,21 @@ class MevzuatFetcher:
         date_str: str,
         output_base_dir: Optional[Path] = None,
         transport: Optional[OfficialBrowserTransport] = None,
+        retry_policy: Optional[RetryPolicy] = None,
     ):
         self.iso_date, self.display_date = normalize_date_formats(date_str)
         self.output_base_dir = output_base_dir or (DOWNLOADS_DIR / self.iso_date / "sources")
         self.output_base_dir.mkdir(parents=True, exist_ok=True)
         self.transport = transport or OfficialBrowserTransport()
+        self.retry_policy = retry_policy or RetryPolicy()
+        self._fihrist_source_url: Optional[str] = None
+
+    def _fetch_source(self, url: str) -> BrowserResponse:
+        return self.retry_policy.run(
+            lambda: self.transport.fetch(url),
+            is_retryable=is_retryable_source_error,
+            operation_name=f"source fetch {url}",
+        )
 
     def fetch_fihrist_page(self) -> BrowserResponse:
         """
@@ -107,26 +118,38 @@ class MevzuatFetcher:
             ALIAS_FIHRIST_TEMPLATE.format(date_str=self.display_date),
         ]
 
-        last_error = None
-        for target_url in urls_to_try:
-            logger.info(f"Fihrist sayfası deneniyor: {target_url}")
-            try:
-                response = self.transport.fetch(target_url)
-                logger.info(f"HTTP Yanıt Kodu: {response.status} ({target_url})")
-                return response
-            except InvalidSourceResponse as e:
-                response = e.response
-                if response is not None and response.status == 404:
+        def fetch_from_either_origin() -> BrowserResponse:
+            last_error = None
+            for target_url in urls_to_try:
+                logger.info(f"Fihrist sayfası deneniyor: {target_url}")
+                self._fihrist_source_url = target_url
+                try:
+                    response = self.transport.fetch(target_url)
+                    logger.info(f"HTTP Yanıt Kodu: {response.status} ({target_url})")
                     return response
-                if response is None or not 500 <= response.status < 600:
-                    raise
-                logger.warning(f"5xx Sunucu hatası ({response.status}), alias denenecek.")
-                last_error = e
-            except RetryableTransportError as e:
-                logger.warning(f"Fihrist yükleme hatası ({target_url}): {e}")
-                last_error = e
+                except InvalidSourceResponse as error:
+                    response = error.response
+                    if response is not None and response.status == 404:
+                        return response
+                    if not is_retryable_source_error(error):
+                        raise
+                    logger.warning(
+                        "Geçici sunucu hatası (%s), diğer resmî kök denenecek.",
+                        response.status if response is not None else "bilinmiyor",
+                    )
+                    last_error = error
+                except RetryableTransportError as error:
+                    logger.warning(f"Fihrist yükleme hatası ({target_url}): {error}")
+                    last_error = error
+            if last_error is None:
+                raise RuntimeError("Fihrist için resmî kaynak adresi tanımlı değil")
+            raise last_error
 
-        raise RuntimeError(f"Fihrist sayfası alınamadı. Son hata: {last_error}")
+        return self.retry_policy.run(
+            fetch_from_either_origin,
+            is_retryable=is_retryable_source_error,
+            operation_name="fihrist fetch",
+        )
 
     def extract_resmi_gazete_number(self, soup: BeautifulSoup) -> str:
         """Extracts the issue number from page, e.g. 32547 or 32500"""
@@ -238,7 +261,7 @@ class MevzuatFetcher:
         logger.info(f"İndiriliyor [{role}]: {url} -> {target_path}")
 
         try:
-            response = self.transport.fetch(url)
+            response = self._fetch_source(url)
             return self._save_response(
                 url,
                 response,
@@ -285,7 +308,7 @@ class MevzuatFetcher:
         url = teblig_info["url"]
         title = teblig_info["title"]
 
-        main_response = self.transport.fetch(url)
+        main_response = self._fetch_source(url)
         media_type = main_response.content_type.partition(";")[0].strip().lower()
         is_pdf = (
             urlparse(url).path.lower().endswith(".pdf")
@@ -314,7 +337,7 @@ class MevzuatFetcher:
                 href = tag.get("href") or tag.get("src")
                 if not href:
                     continue
-                abs_url = urljoin(url, href)
+                abs_url = urljoin(main_manifest.final_url, href)
                 try:
                     validate_official_url(abs_url)
                 except UnsafeSourceUrl:
@@ -322,7 +345,10 @@ class MevzuatFetcher:
 
                 parsed_att = urlparse(abs_url)
                 ext = Path(parsed_att.path).suffix.lower()
-                if ext in ALLOWED_ATTACHMENT_EXTENSIONS and abs_url != url:
+                if ext in ALLOWED_ATTACHMENT_EXTENSIONS and abs_url not in {
+                    url,
+                    main_manifest.final_url,
+                }:
                     attachment_urls.add(abs_url)
 
             used_names = {_filename_key(name) for name in _RESERVED_DOCUMENT_FILENAMES}
@@ -381,7 +407,7 @@ class MevzuatFetcher:
             f.write(fihrist_response.body)
 
         index_manifest = FileManifest(
-            source_url=fihrist_response.final_url,
+            source_url=self._fihrist_source_url or fihrist_response.final_url,
             final_url=fihrist_response.final_url,
             http_status=fihrist_response.status,
             content_type=fihrist_response.content_type,

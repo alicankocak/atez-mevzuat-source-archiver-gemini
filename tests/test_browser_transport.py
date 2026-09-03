@@ -504,6 +504,53 @@ class FakeTransport:
         return result
 
 
+class SequenceTransport:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.fetched_urls = []
+
+    def fetch(self, url):
+        self.fetched_urls.append(url)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def test_document_download_retries_retryable_source_failure_with_injected_delay(
+    tmp_path,
+):
+    from src.retry_policy import RetryPolicy
+
+    url = "https://resmigazete.gov.tr/document.pdf"
+    response = BrowserResponse(200, url, "application/pdf", PDF_BYTES)
+    transport = SequenceTransport(
+        [RetryableTransportError("temporary timeout"), response]
+    )
+    delays = []
+    fetcher = MevzuatFetcher(
+        "2026-08-14",
+        output_base_dir=tmp_path,
+        transport=transport,
+        retry_policy=RetryPolicy(
+            max_attempts=3,
+            initial_delay_seconds=0.2,
+            sleep=delays.append,
+        ),
+    )
+
+    manifest = fetcher.download_file(
+        url,
+        tmp_path / "rg-33299" / "doc-01" / "source.pdf",
+        role="main_document",
+        parent_doc_id="doc-01",
+    )
+
+    assert manifest.sha256
+    assert transport.fetched_urls == [url, url]
+    assert delays == [0.2]
+
+
 def test_fetcher_routes_fihrist_through_browser_transport(monkeypatch, tmp_path):
     url = "https://resmigazete.gov.tr/14.08.2026"
     response = BrowserResponse(
@@ -748,6 +795,75 @@ def test_document_fetches_only_https_official_attachments(tmp_path):
         allowed_image_url,
         allowed_pdf_url,
     ]
+
+
+def test_redirected_html_resolves_relative_attachments_from_final_url(tmp_path):
+    requested_url = "https://resmigazete.gov.tr/legacy/document.html"
+    final_url = "https://www.resmigazete.gov.tr/archive/2026/document.html"
+    attachment_url = "https://www.resmigazete.gov.tr/archive/2026/annex.pdf"
+    document_body = b'<a href="annex.pdf">required annex</a>'
+    transport = FakeTransport(
+        {
+            requested_url: BrowserResponse(
+                200,
+                final_url,
+                "text/html; charset=utf-8",
+                document_body,
+            ),
+            attachment_url: BrowserResponse(
+                200,
+                attachment_url,
+                "application/pdf",
+                PDF_BYTES,
+            ),
+        }
+    )
+    fetcher = MevzuatFetcher(
+        "2026-08-14",
+        output_base_dir=tmp_path,
+        transport=transport,
+    )
+
+    document = fetcher.process_teblig_document(
+        {"title": "Fixture", "url": requested_url},
+        doc_index=1,
+        rg_dir=tmp_path / "rg-33299",
+    )
+
+    assert transport.fetched_urls == [requested_url, attachment_url]
+    assert document.main_document.source_url == requested_url
+    assert document.main_document.final_url == final_url
+    assert document.attachments[0].source_url == attachment_url
+
+
+def test_index_manifest_preserves_requested_and_redirected_fihrist_urls(tmp_path):
+    requested_url = "https://resmigazete.gov.tr/14.08.2026"
+    final_url = "https://www.resmigazete.gov.tr/archive/2026/08/14/index.html"
+    fihrist_body = (
+        "<!doctype html>"
+        "<title>14 Ağustos 2026 Tarihli ve 33299 Sayılı Resmî Gazete</title>"
+        "<span id='spanGazeteTarih'>33299 Sayılı Resmî Gazete</span>"
+        "<h2 class='html-subtitle'>YÜRÜTME VE İDARE BÖLÜMÜ</h2>"
+    ).encode("utf-8")
+    fetcher = MevzuatFetcher(
+        "2026-08-14",
+        output_base_dir=tmp_path,
+        transport=FakeTransport(
+            {
+                requested_url: BrowserResponse(
+                    200,
+                    final_url,
+                    "text/html; charset=utf-8",
+                    fihrist_body,
+                )
+            }
+        ),
+    )
+
+    manifest, _ = fetcher.run()
+
+    assert manifest.index_file.source_url == requested_url
+    assert manifest.index_file.final_url == final_url
 
 
 def test_attachment_validation_failure_aborts_document_archive(tmp_path):

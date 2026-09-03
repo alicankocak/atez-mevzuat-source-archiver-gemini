@@ -7,8 +7,11 @@ import pytest
 from pydantic import ValidationError
 
 import src.drive_watcher as drive_watcher_module
+from src.browser_transport import BrowserResponse, RetryableTransportError
 from src.drive_watcher import DriveRequestWatcher
+from src.fetcher import MevzuatFetcher as RealMevzuatFetcher
 from src.models import ReadyGate, SourceRequest
+from src.retry_policy import RetryPolicy
 
 
 REQUEST_PAYLOAD = {
@@ -128,7 +131,11 @@ def drive():
 @pytest.fixture
 def watcher(monkeypatch, drive, tmp_path):
     uploader = FakeUploader(drive)
-    monkeypatch.setattr(drive_watcher_module, "DriveUploader", lambda: uploader)
+    monkeypatch.setattr(
+        drive_watcher_module,
+        "DriveUploader",
+        lambda **_kwargs: uploader,
+    )
     instance = DriveRequestWatcher(check_interval_seconds=0)
     instance.claim_lock_dir = tmp_path
     return instance
@@ -311,8 +318,9 @@ def test_process_uses_request_bytes_and_claims_before_fetch(
     drive.media["file-1"] = json.dumps(REQUEST_PAYLOAD).encode("utf-8")
 
     class FakeFetcher:
-        def __init__(self, date_str):
+        def __init__(self, date_str, retry_policy):
             assert date_str == "2026-08-14"
+            assert retry_policy is watcher.retry_policy
 
         def run(self):
             drive.events.append(("fetch", "2026-08-14"))
@@ -362,7 +370,7 @@ def test_incomplete_ready_gate_does_not_skip_collection(
     fetch_count = 0
 
     class FakeFetcher:
-        def __init__(self, date_str):
+        def __init__(self, date_str, **_kwargs):
             assert date_str == "2026-08-14"
 
         def run(self):
@@ -414,7 +422,7 @@ def test_boolean_upload_result_fails_request(
     drive.media["file-1"] = json.dumps(REQUEST_PAYLOAD).encode("utf-8")
 
     class FakeFetcher:
-        def __init__(self, date_str):
+        def __init__(self, date_str, **_kwargs):
             assert date_str == "2026-08-14"
 
         def run(self):
@@ -498,7 +506,7 @@ def test_same_mac_watchers_cannot_collect_same_date_concurrently(
     fetch_count = 0
 
     class ReentrantFetcher:
-        def __init__(self, date_str):
+        def __init__(self, date_str, **_kwargs):
             assert date_str == "2026-08-14"
 
         def run(self):
@@ -520,3 +528,57 @@ def test_same_mac_watchers_cannot_collect_same_date_concurrently(
         if update["body"].get("name", "").startswith("PROCESSING_")
     ]
     assert [update["file_id"] for update in processing_updates] == ["file-1"]
+
+
+def test_watcher_writes_failed_only_after_retryable_source_attempts_exhaust(
+    monkeypatch, watcher, drive, pending_file, tmp_path
+):
+    drive.media["file-1"] = json.dumps(REQUEST_PAYLOAD).encode("utf-8")
+    fihrist_url = "https://resmigazete.gov.tr/14.08.2026"
+    document_url = "https://resmigazete.gov.tr/document.html"
+    fihrist_body = (
+        "<!doctype html>"
+        "<title>14 Ağustos 2026 Tarihli ve 33299 Sayılı Resmî Gazete</title>"
+        "<span id='spanGazeteTarih'>33299 Sayılı Resmî Gazete</span>"
+        "<h2 class='html-subtitle'>TEBLİĞLER</h2>"
+        "<div class='fihrist-item mb-1'>"
+        "<a href='/document.html'>Fixture Tebliğ</a>"
+        "</div>"
+    ).encode("utf-8")
+    document_attempts = 0
+
+    class Transport:
+        def fetch(self, url):
+            nonlocal document_attempts
+            if url == fihrist_url:
+                return BrowserResponse(200, url, "text/html", fihrist_body)
+            assert url == document_url
+            document_attempts += 1
+            raise RetryableTransportError("temporary document timeout")
+
+    delays = []
+    watcher.retry_policy = RetryPolicy(
+        max_attempts=3,
+        initial_delay_seconds=0.1,
+        backoff_multiplier=2,
+        sleep=delays.append,
+    )
+
+    def fetcher_factory(date_str, retry_policy):
+        return RealMevzuatFetcher(
+            date_str,
+            output_base_dir=tmp_path / "sources",
+            transport=Transport(),
+            retry_policy=retry_policy,
+        )
+
+    monkeypatch.setattr(drive_watcher_module, "MevzuatFetcher", fetcher_factory)
+
+    watcher.process_request(pending_file)
+
+    assert document_attempts == 3
+    assert delays == [0.1, 0.2]
+    assert not any(event[0] == "upload" for event in drive.events)
+    result = json.loads(drive.updates[-1]["media"])
+    assert result["status"] == "FAILED"
+    assert "temporary document timeout" in result["error"]

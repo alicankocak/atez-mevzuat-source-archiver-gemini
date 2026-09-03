@@ -1,11 +1,8 @@
-import fcntl
 import io
 import json
 import logging
 import re
-import tempfile
 import time
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -13,9 +10,11 @@ from typing import Dict, List, Optional, Tuple
 from googleapiclient.http import MediaIoBaseUpload
 from pydantic import ValidationError
 
+from src.date_lease import DEFAULT_DATE_LEASE_DIR, date_archive_lease
 from src.drive_uploader import DriveUploader
 from src.fetcher import MevzuatFetcher
 from src.models import ReadyGate, SourceRequest, SourceRequestResult
+from src.retry_policy import RetryPolicy, is_retryable_drive_error
 
 logger = logging.getLogger("atez.watcher")
 logging.basicConfig(
@@ -27,12 +26,26 @@ logging.basicConfig(
 class DriveRequestWatcher:
     CLAIM_LEASE_SECONDS = 15 * 60
 
-    def __init__(self, check_interval_seconds: int = 15):
+    def __init__(
+        self,
+        check_interval_seconds: int = 15,
+        *,
+        uploader: Optional[DriveUploader] = None,
+        claim_lock_dir: Path | str | None = None,
+        retry_policy: Optional[RetryPolicy] = None,
+    ):
         self.interval = check_interval_seconds
         self.claim_lock_dir = (
-            Path(tempfile.gettempdir()) / "atez-mevzuat-source-archiver-gemini-locks"
+            Path(claim_lock_dir)
+            if claim_lock_dir is not None
+            else DEFAULT_DATE_LEASE_DIR
         )
-        self.uploader = DriveUploader()
+        self.retry_policy = (
+            retry_policy
+            or getattr(uploader, "retry_policy", None)
+            or RetryPolicy()
+        )
+        self.uploader = uploader or DriveUploader(retry_policy=self.retry_policy)
         if not self.uploader.service:
             raise RuntimeError("Drive servisi başlatılamadı. .env dosyasını kontrol edin.")
 
@@ -43,6 +56,13 @@ class DriveRequestWatcher:
         logger.info(
             "Drive Request Watcher başlatıldı. Dinlenen klasör ID: %s",
             self.requests_folder_id,
+        )
+
+    def _drive_call(self, operation, *, operation_name: str):
+        return self.retry_policy.run(
+            operation,
+            is_retryable=is_retryable_drive_error,
+            operation_name=operation_name,
         )
 
     def list_pending_requests(self) -> List[Dict]:
@@ -57,21 +77,27 @@ class DriveRequestWatcher:
             "not name contains 'FAILED_' and "
             "not name contains 'processed_'"
         )
-        response = (
-            self.uploader.service.files()
+        response = self._drive_call(
+            lambda: self.uploader.service.files()
             .list(
                 q=query,
                 spaces="drive",
                 fields="files(id, name, createdTime)",
             )
-            .execute()
+            .execute(),
+            operation_name="list pending source requests",
         )
         pending = response.get("files", [])
         return pending + self._recover_stale_claims()
 
     def load_request(self, file_id: str) -> SourceRequest:
         """Parse a request only from its UTF-8 JSON bytes."""
-        content = self.uploader.service.files().get_media(fileId=file_id).execute()
+        content = self._drive_call(
+            lambda: self.uploader.service.files()
+            .get_media(fileId=file_id)
+            .execute(),
+            operation_name=f"download source request {file_id}",
+        )
         return SourceRequest.model_validate_json(content)
 
     def claim_request(
@@ -95,10 +121,12 @@ class DriveRequestWatcher:
                     "claimed_at": datetime.now(timezone.utc).isoformat(),
                 },
             }
-        self.uploader.service.files().update(
-            fileId=file_id,
-            body=body,
-        ).execute()
+        self._drive_call(
+            lambda: self.uploader.service.files()
+            .update(fileId=file_id, body=body)
+            .execute(),
+            operation_name=f"claim source request {file_id}",
+        )
         claimed_name = body["name"]
         logger.info("Talep sahiplenildi: %s", claimed_name)
         return claimed_name
@@ -114,14 +142,20 @@ class DriveRequestWatcher:
         self, file_id: str, name: str, result: SourceRequestResult
     ) -> None:
         payload = result.model_dump_json(exclude_none=True, indent=2).encode("utf-8")
-        media = MediaIoBaseUpload(
-            io.BytesIO(payload), mimetype="application/json", resumable=False
+        self._drive_call(
+            lambda: self.uploader.service.files()
+            .update(
+                fileId=file_id,
+                body={"name": name},
+                media_body=MediaIoBaseUpload(
+                    io.BytesIO(payload),
+                    mimetype="application/json",
+                    resumable=False,
+                ),
+            )
+            .execute(),
+            operation_name=f"write source request result {file_id}",
         )
-        self.uploader.service.files().update(
-            fileId=file_id,
-            body={"name": name},
-            media_body=media,
-        ).execute()
 
     def complete_request(
         self,
@@ -166,32 +200,23 @@ class DriveRequestWatcher:
             },
             indent=2,
         ).encode("utf-8")
-        media = MediaIoBaseUpload(
-            io.BytesIO(payload), mimetype="application/json", resumable=False
+        self._drive_call(
+            lambda: self.uploader.service.files()
+            .update(
+                fileId=file_id,
+                body={"name": f"FAILED_{terminal_source_name}"},
+                media_body=MediaIoBaseUpload(
+                    io.BytesIO(payload),
+                    mimetype="application/json",
+                    resumable=False,
+                ),
+            )
+            .execute(),
+            operation_name=f"terminalize invalid source request {file_id}",
         )
-        self.uploader.service.files().update(
-            fileId=file_id,
-            body={"name": f"FAILED_{terminal_source_name}"},
-            media_body=media,
-        ).execute()
 
-    @contextmanager
     def _date_claim_lock(self, report_date: str):
-        self.claim_lock_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = self.claim_lock_dir / f"{report_date}.lock"
-        lock_file = lock_path.open("a+")
-        acquired = False
-        try:
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-            except BlockingIOError:
-                pass
-            yield acquired
-        finally:
-            if acquired:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-            lock_file.close()
+        return date_archive_lease(report_date, lock_dir=self.claim_lock_dir)
 
     def _list_processing_requests(self) -> List[Dict]:
         query = (
@@ -200,14 +225,15 @@ class DriveRequestWatcher:
             "trashed = false and "
             "name contains 'PROCESSING_'"
         )
-        response = (
-            self.uploader.service.files()
+        response = self._drive_call(
+            lambda: self.uploader.service.files()
             .list(
                 q=query,
                 spaces="drive",
                 fields="files(id, name, modifiedTime, appProperties)",
             )
-            .execute()
+            .execute(),
+            operation_name="list processing source requests",
         )
         return response.get("files", [])
 
@@ -232,17 +258,22 @@ class DriveRequestWatcher:
             f"SOURCE_REQUEST__{request.report_date.isoformat()}__"
             f"{request.request_id}.json"
         )
-        self.uploader.service.files().update(
-            fileId=file_info["id"],
-            body={
-                "name": pending_name,
-                "appProperties": {
-                    "report_date": None,
-                    "request_id": None,
-                    "claimed_at": None,
+        self._drive_call(
+            lambda: self.uploader.service.files()
+            .update(
+                fileId=file_info["id"],
+                body={
+                    "name": pending_name,
+                    "appProperties": {
+                        "report_date": None,
+                        "request_id": None,
+                        "claimed_at": None,
+                    },
                 },
-            },
-        ).execute()
+            )
+            .execute(),
+            operation_name=f"return stale source request {file_info['id']} to pending",
+        )
         logger.warning("Süresi dolan talep yeniden kuyruğa alındı: %s", pending_name)
         return {"id": file_info["id"], "name": pending_name}
 
@@ -268,7 +299,7 @@ class DriveRequestWatcher:
                     recovered.append(self._return_claim_to_pending(file_info, request))
         return recovered
 
-    def _has_processing_request(self, report_date: str) -> bool:
+    def has_processing_request(self, report_date: str) -> bool:
         for file_info in self._list_processing_requests():
             try:
                 request = self.load_request(file_info["id"])
@@ -282,6 +313,9 @@ class DriveRequestWatcher:
             return True
         return False
 
+    def _has_processing_request(self, report_date: str) -> bool:
+        return self.has_processing_request(report_date)
+
     def _find_folder(self, name: str, parent_id: str) -> Optional[Dict]:
         query = (
             f"name = '{name}' and "
@@ -289,15 +323,16 @@ class DriveRequestWatcher:
             "mimeType = 'application/vnd.google-apps.folder' and "
             "trashed = false"
         )
-        response = (
-            self.uploader.service.files()
+        response = self._drive_call(
+            lambda: self.uploader.service.files()
             .list(q=query, spaces="drive", fields="files(id, name)")
-            .execute()
+            .execute(),
+            operation_name=f"find Drive folder {name}",
         )
         files = response.get("files", [])
         return files[0] if files else None
 
-    def _find_ready_result(self, report_date: str) -> Optional[Tuple[str, str]]:
+    def find_ready_result(self, report_date: str) -> Optional[Tuple[str, str]]:
         date_folder = self._find_folder(report_date, self.root_id)
         if not date_folder:
             return None
@@ -310,30 +345,31 @@ class DriveRequestWatcher:
             "mimeType = 'application/vnd.google-apps.folder' and "
             "trashed = false"
         )
-        rg_folders = (
-            self.uploader.service.files()
+        rg_folders = self._drive_call(
+            lambda: self.uploader.service.files()
             .list(q=rg_query, spaces="drive", fields="files(id, name)")
-            .execute()
-            .get("files", [])
-        )
+            .execute(),
+            operation_name=f"list issue folders for {report_date}",
+        ).get("files", [])
         for rg_folder in rg_folders:
             ready_query = (
                 "name = '_READY.json' and "
                 f"'{rg_folder['id']}' in parents and "
                 "trashed = false"
             )
-            ready_files = (
-                self.uploader.service.files()
+            ready_files = self._drive_call(
+                lambda: self.uploader.service.files()
                 .list(q=ready_query, spaces="drive", fields="files(id, name)")
-                .execute()
-                .get("files", [])
-            )
+                .execute(),
+                operation_name=f"list READY gates in {rg_folder['name']}",
+            ).get("files", [])
             for ready_file in ready_files:
                 try:
-                    content = (
-                        self.uploader.service.files()
+                    content = self._drive_call(
+                        lambda: self.uploader.service.files()
                         .get_media(fileId=ready_file["id"])
-                        .execute()
+                        .execute(),
+                        operation_name=f"download READY gate {ready_file['id']}",
                     )
                     raw_gate = json.loads(content)
                     if not isinstance(raw_gate, dict):
@@ -385,6 +421,9 @@ class DriveRequestWatcher:
                     return rg_number, ready_file["id"]
         return None
 
+    def _find_ready_result(self, report_date: str) -> Optional[Tuple[str, str]]:
+        return self.find_ready_result(report_date)
+
     def process_request(self, file_info: Dict) -> None:
         file_id = file_info["id"]
         file_name = file_info["name"]
@@ -415,8 +454,8 @@ class DriveRequestWatcher:
         request: SourceRequest,
         target_date: str,
     ) -> None:
-        processing_exists = self._has_processing_request(target_date)
-        ready_result = self._find_ready_result(target_date)
+        processing_exists = self.has_processing_request(target_date)
+        ready_result = self.find_ready_result(target_date)
 
         if ready_result:
             self.claim_request(file_id, file_name, request)
@@ -435,7 +474,10 @@ class DriveRequestWatcher:
         self.claim_request(file_id, file_name, request)
         logger.info("==> Hedef Tarih İçin Arşivleme Başlatılıyor: %s <==", target_date)
         try:
-            fetcher = MevzuatFetcher(date_str=target_date)
+            fetcher = MevzuatFetcher(
+                date_str=target_date,
+                retry_policy=self.retry_policy,
+            )
             _, rg_dir = fetcher.run()
 
             folder_ids = self.uploader.ensure_date_hierarchy(target_date)

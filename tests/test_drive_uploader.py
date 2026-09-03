@@ -8,11 +8,13 @@ from pydantic import ValidationError
 
 from src.drive_uploader import DriveUploader, DriveVerificationError
 from src.models import ReadyGate
+from src.retry_policy import RetryPolicy
 
 
 class RecordingUploader(DriveUploader):
     def __init__(self):
         self.service = object()
+        self.retry_policy = RetryPolicy(sleep=lambda _delay: None)
         self.upload_names = []
         self.uploaded_bytes = {}
         self.fail_verification_for = None

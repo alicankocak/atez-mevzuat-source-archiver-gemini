@@ -23,6 +23,7 @@ from src.models import (
     ReadyGate,
     SourceManifest,
 )
+from src.retry_policy import RetryPolicy, is_retryable_drive_error
 
 logger = logging.getLogger("atez.drive")
 
@@ -38,9 +39,22 @@ class ArchiveValidationError(RuntimeError):
 class DriveUploader:
     FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 
-    def __init__(self, root_folder_id: Optional[str] = None):
+    def __init__(
+        self,
+        root_folder_id: Optional[str] = None,
+        *,
+        retry_policy: Optional[RetryPolicy] = None,
+    ):
         self.root_folder_id = root_folder_id or DRIVE_ROOT_FOLDER_ID
+        self.retry_policy = retry_policy or RetryPolicy()
         self.service = self._init_drive_service()
+
+    def execute_with_retry(self, operation, *, operation_name: str):
+        return self.retry_policy.run(
+            operation,
+            is_retryable=is_retryable_drive_error,
+            operation_name=operation_name,
+        )
 
     def _init_drive_service(self):
         client_id = os.getenv("GOOGLE_CLIENT_ID")
@@ -62,8 +76,14 @@ class DriveUploader:
             client_secret=client_secret,
             scopes=["https://www.googleapis.com/auth/drive"],
         )
-        creds.refresh(Request())
-        return build("drive", "v3", credentials=creds)
+        self.execute_with_retry(
+            lambda: creds.refresh(Request()),
+            operation_name="Drive credential refresh",
+        )
+        return self.execute_with_retry(
+            lambda: build("drive", "v3", credentials=creds),
+            operation_name="Drive service initialization",
+        )
 
     def find_or_create_folder(self, folder_name: str, parent_id: str) -> str:
         """Finds a folder under parent_id, or creates it if not found."""
@@ -76,20 +96,35 @@ class DriveUploader:
             f"mimeType = 'application/vnd.google-apps.folder' and "
             f"trashed = false"
         )
-        response = self.service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
-        files = response.get("files", [])
-
-        if files:
-            return files[0]["id"]
-
         folder_metadata = {
             "name": folder_name,
             "mimeType": "application/vnd.google-apps.folder",
             "parents": [parent_id],
         }
-        folder = self.service.files().create(body=folder_metadata, fields="id").execute()
-        logger.info(f"Drive klasörü oluşturuldu: {folder_name} (ID: {folder.get('id')})")
-        return folder.get("id")
+
+        def find_or_create():
+            response = (
+                self.service.files()
+                .list(q=query, spaces="drive", fields="files(id, name)")
+                .execute()
+            )
+            files = response.get("files", [])
+            if files:
+                return files[0]["id"], False
+            folder = (
+                self.service.files()
+                .create(body=folder_metadata, fields="id")
+                .execute()
+            )
+            return folder.get("id"), True
+
+        folder_id, created = self.execute_with_retry(
+            find_or_create,
+            operation_name=f"find or create Drive folder {folder_name}",
+        )
+        if created:
+            logger.info(f"Drive klasörü oluşturuldu: {folder_name} (ID: {folder_id})")
+        return folder_id
 
     def ensure_date_hierarchy(self, iso_date: str) -> Dict[str, str]:
         """
@@ -123,31 +158,58 @@ class DriveUploader:
             f"'{parent_folder_id}' in parents and "
             f"trashed = false"
         )
-        existing = self.service.files().list(q=query, spaces="drive", fields="files(id, name)").execute().get("files", [])
 
-        media = MediaFileUpload(str(local_file_path), resumable=True)
-
-        if existing:
-            file_id = existing[0]["id"]
-            updated = self.service.files().update(
-                fileId=file_id,
-                media_body=media,
-                fields="id, webViewLink",
-            ).execute()
-            logger.info(f"Drive dosyası güncellendi: {filename} ({file_id})")
-            return updated.get("id"), updated.get("webViewLink", "")
-        else:
+        def upsert_file():
+            existing = (
+                self.service.files()
+                .list(
+                    q=query,
+                    spaces="drive",
+                    fields="files(id, name, webViewLink)",
+                )
+                .execute()
+                .get("files", [])
+            )
+            if existing:
+                file_id = existing[0]["id"]
+                updated = (
+                    self.service.files()
+                    .update(
+                        fileId=file_id,
+                        media_body=MediaFileUpload(
+                            str(local_file_path), resumable=True
+                        ),
+                        fields="id, webViewLink",
+                    )
+                    .execute()
+                )
+                return updated, True
             file_metadata = {
                 "name": filename,
                 "parents": [parent_folder_id],
             }
-            created = self.service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields="id, webViewLink",
-            ).execute()
-            logger.info(f"Drive dosyası yüklendi: {filename} ({created.get('id')})")
-            return created.get("id"), created.get("webViewLink", "")
+            created = (
+                self.service.files()
+                .create(
+                    body=file_metadata,
+                    media_body=MediaFileUpload(
+                        str(local_file_path), resumable=True
+                    ),
+                    fields="id, webViewLink",
+                )
+                .execute()
+            )
+            return created, False
+
+        uploaded, updated_existing = self.execute_with_retry(
+            upsert_file,
+            operation_name=f"upload Drive file {filename}",
+        )
+        if updated_existing:
+            logger.info(f"Drive dosyası güncellendi: {filename} ({uploaded.get('id')})")
+        else:
+            logger.info(f"Drive dosyası yüklendi: {filename} ({uploaded.get('id')})")
+        return uploaded.get("id"), uploaded.get("webViewLink", "")
 
     def verify_file_hash(self, drive_file_id: str, expected_sha256: str, expected_size: int) -> bool:
         """
@@ -156,14 +218,19 @@ class DriveUploader:
         if not self.service:
             return False
 
-        request = self.service.files().get_media(fileId=drive_file_id)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
+        def download_bytes() -> bytes:
+            request = self.service.files().get_media(fileId=drive_file_id)
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            return fh.getvalue()
 
-        content = fh.getvalue()
+        content = self.execute_with_retry(
+            download_bytes,
+            operation_name=f"download Drive file {drive_file_id} for verification",
+        )
         actual_size = len(content)
         actual_sha256 = hashlib.sha256(content).hexdigest()
 
@@ -188,16 +255,22 @@ class DriveUploader:
             }
             if page_token:
                 request_args["pageToken"] = page_token
-            response = self.service.files().list(**request_args).execute()
+            response = self.execute_with_retry(
+                lambda: self.service.files().list(**request_args).execute(),
+                operation_name=f"list Drive children of {parent_folder_id}",
+            )
             children.extend(response.get("files", []))
             page_token = response.get("nextPageToken")
             if not page_token:
                 return children
 
     def _trash_item(self, drive_file_id: str) -> None:
-        self.service.files().update(
-            fileId=drive_file_id, body={"trashed": True}
-        ).execute()
+        self.execute_with_retry(
+            lambda: self.service.files()
+            .update(fileId=drive_file_id, body={"trashed": True})
+            .execute(),
+            operation_name=f"trash Drive item {drive_file_id}",
+        )
 
     @staticmethod
     def _manifest_relative_path(

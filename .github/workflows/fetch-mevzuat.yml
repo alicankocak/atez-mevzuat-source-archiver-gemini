@@ -33,12 +33,41 @@ jobs:
 
       - name: Hedef Tarihi Belirle
         id: determine_date
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPORT_DATE_INPUT: ${{ github.event.inputs.report_date }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.report_date }}" ]; then
-            echo "TARGET_DATE=${{ github.event.inputs.report_date }}" >> $GITHUB_ENV
-          else
-            echo "TARGET_DATE=" >> $GITHUB_ENV
-          fi
+          python3 - <<'PY'
+          import datetime
+          import os
+          import re
+          from pathlib import Path
+
+          report_date = (
+              os.environ.get("REPORT_DATE_INPUT", "")
+              if os.environ.get("EVENT_NAME") == "workflow_dispatch"
+              else ""
+          )
+          if report_date:
+              try:
+                  if re.fullmatch(r"\d{4}-\d{2}-\d{2}", report_date):
+                      datetime.date.fromisoformat(report_date)
+                  elif re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", report_date):
+                      datetime.datetime.strptime(report_date, "%d.%m.%Y")
+                  else:
+                      raise ValueError
+              except ValueError as error:
+                  raise SystemExit(
+                      "report_date DD.MM.YYYY veya YYYY-MM-DD biçiminde "
+                      "geçerli bir takvim tarihi olmalıdır"
+                  ) from error
+
+          delimiter = "ATEZ_TARGET_DATE_EOF"
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as env_file:
+              env_file.write(f"TARGET_DATE<<{delimiter}\n")
+              env_file.write(f"{report_date}\n")
+              env_file.write(f"{delimiter}\n")
+          PY
 
       - name: Kaynakları İndir ve Google Drive'a Doğrulanmış Olarak Yükle
         env:
