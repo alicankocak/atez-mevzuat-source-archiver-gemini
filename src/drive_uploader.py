@@ -10,12 +10,19 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from google.auth.transport.requests import Request
 from pydantic import ValidationError
 
+from src.browser_transport import UnsafeSourceUrl, validate_official_url
 from src.config import (
     DRIVE_ROOT_FOLDER_ID,
     DRIVE_ROOT_FOLDER_NAME,
     SUBFOLDERS,
 )
-from src.models import FileManifest, ReadyFile, ReadyGate, SourceManifest
+from src.models import (
+    DocumentItem,
+    FileManifest,
+    ReadyFile,
+    ReadyGate,
+    SourceManifest,
+)
 
 logger = logging.getLogger("atez.drive")
 
@@ -171,16 +178,21 @@ class DriveUploader:
         return True
 
     def _list_children(self, parent_folder_id: str) -> List[Dict]:
-        response = (
-            self.service.files()
-            .list(
-                q=f"'{parent_folder_id}' in parents and trashed = false",
-                spaces="drive",
-                fields="files(id, name, mimeType)",
-            )
-            .execute()
-        )
-        return response.get("files", [])
+        children = []
+        page_token = None
+        while True:
+            request_args = {
+                "q": f"'{parent_folder_id}' in parents and trashed = false",
+                "spaces": "drive",
+                "fields": "nextPageToken, files(id, name, mimeType)",
+            }
+            if page_token:
+                request_args["pageToken"] = page_token
+            response = self.service.files().list(**request_args).execute()
+            children.extend(response.get("files", []))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                return children
 
     def _trash_item(self, drive_file_id: str) -> None:
         self.service.files().update(
@@ -208,6 +220,56 @@ class DriveUploader:
             raise ArchiveValidationError("invalid source manifest path")
         return Path(*relative_parts)
 
+    @staticmethod
+    def _require_official_url(url: str) -> None:
+        try:
+            validate_official_url(url)
+        except UnsafeSourceUrl as error:
+            raise ArchiveValidationError(
+                f"manifest URL is not an official HTTPS source: {url}"
+            ) from error
+
+    def _validate_file_declaration(
+        self,
+        local_rg_dir: Path,
+        file_manifest: FileManifest,
+        *,
+        expected_role: str,
+        expected_parent: Optional[str],
+    ) -> Path:
+        if file_manifest.role != expected_role:
+            raise ArchiveValidationError(
+                f"invalid {expected_role} role: {file_manifest.role}"
+            )
+        if file_manifest.parent_document_id != expected_parent:
+            raise ArchiveValidationError(
+                f"invalid {expected_role} parent_document_id"
+            )
+        self._require_official_url(file_manifest.source_url)
+        self._require_official_url(file_manifest.final_url)
+        relative_path = self._manifest_relative_path(local_rg_dir, file_manifest)
+        if expected_parent and (
+            not relative_path.parts or relative_path.parts[0] != expected_parent
+        ):
+            raise ArchiveValidationError(
+                f"invalid {expected_role} path association"
+            )
+        return relative_path
+
+    @staticmethod
+    def _validate_declared_bytes(
+        local_file: Path, relative_path: Path, file_manifest: FileManifest
+    ) -> None:
+        content = local_file.read_bytes()
+        if len(content) != file_manifest.size_bytes:
+            raise ArchiveValidationError(
+                f"declared size mismatch: {relative_path.as_posix()}"
+            )
+        if hashlib.sha256(content).hexdigest() != file_manifest.sha256:
+            raise ArchiveValidationError(
+                f"declared sha256 mismatch: {relative_path.as_posix()}"
+            )
+
     def _collect_declared_files(self, local_rg_dir: Path) -> List[Path]:
         source_manifest_path = local_rg_dir / "source-manifest.json"
         if not source_manifest_path.exists():
@@ -221,14 +283,43 @@ class DriveUploader:
         except (ValidationError, ValueError) as error:
             raise ArchiveValidationError("invalid source-manifest.json") from error
 
+        expected_report_date = local_rg_dir.parent.parent.name
+        if source_manifest.report_date != expected_report_date:
+            raise ArchiveValidationError(
+                "source manifest report_date does not match archive path"
+            )
+        if not local_rg_dir.name.startswith("rg-"):
+            raise ArchiveValidationError("invalid issue folder name")
+        expected_issue_number = local_rg_dir.name.removeprefix("rg-")
+        if source_manifest.resmi_gazete_sayisi != expected_issue_number:
+            raise ArchiveValidationError(
+                "source manifest issue number does not match archive path"
+            )
+        self._require_official_url(source_manifest.fihrist_url)
+
         expected_files = {Path("index.html"), Path("source-manifest.json")}
+        source_records = {}
+
+        def add_source_record(
+            relative_path: Path, file_manifest: FileManifest
+        ) -> None:
+            if relative_path in source_records:
+                raise ArchiveValidationError(
+                    f"duplicate declared source path: {relative_path.as_posix()}"
+                )
+            source_records[relative_path] = file_manifest
+
         if source_manifest.index_file is None:
             raise ArchiveValidationError("missing index file declaration")
-        if (
-            self._manifest_relative_path(local_rg_dir, source_manifest.index_file)
-            != Path("index.html")
-        ):
+        index_relative_path = self._validate_file_declaration(
+            local_rg_dir,
+            source_manifest.index_file,
+            expected_role="daily_index",
+            expected_parent=None,
+        )
+        if index_relative_path != Path("index.html"):
             raise ArchiveValidationError("invalid daily index path")
+        add_source_record(index_relative_path, source_manifest.index_file)
 
         for document in source_manifest.documents:
             document_path = PurePosixPath(document.document_id)
@@ -238,16 +329,27 @@ class DriveUploader:
                 or document_path.name in {"", ".", ".."}
             ):
                 raise ArchiveValidationError("invalid document manifest path")
+            self._require_official_url(document.source_url)
             expected_files.add(Path(document.document_id) / "manifest.json")
             if document.main_document is None:
                 raise ArchiveValidationError("missing main document declaration")
-            expected_files.add(
-                self._manifest_relative_path(local_rg_dir, document.main_document)
+            main_relative_path = self._validate_file_declaration(
+                local_rg_dir,
+                document.main_document,
+                expected_role="main_document",
+                expected_parent=document.document_id,
             )
+            expected_files.add(main_relative_path)
+            add_source_record(main_relative_path, document.main_document)
             for attachment in document.attachments:
-                expected_files.add(
-                    self._manifest_relative_path(local_rg_dir, attachment)
+                attachment_relative_path = self._validate_file_declaration(
+                    local_rg_dir,
+                    attachment,
+                    expected_role="attachment",
+                    expected_parent=document.document_id,
                 )
+                expected_files.add(attachment_relative_path)
+                add_source_record(attachment_relative_path, attachment)
 
         expected_directories: Set[Path] = set()
         for relative_path in expected_files:
@@ -279,6 +381,26 @@ class DriveUploader:
         if missing_files:
             missing = ", ".join(path.as_posix() for path in sorted(missing_files))
             raise ArchiveValidationError(f"missing declared archive files: {missing}")
+
+        for document in source_manifest.documents:
+            document_manifest_path = (
+                local_rg_dir / document.document_id / "manifest.json"
+            )
+            try:
+                stored_document = DocumentItem.model_validate_json(
+                    document_manifest_path.read_bytes()
+                )
+            except (ValidationError, ValueError) as error:
+                raise ArchiveValidationError("invalid document manifest") from error
+            if stored_document != document:
+                raise ArchiveValidationError(
+                    f"document manifest does not match source manifest: {document.document_id}"
+                )
+
+        for relative_path, file_manifest in source_records.items():
+            self._validate_declared_bytes(
+                local_rg_dir / relative_path, relative_path, file_manifest
+            )
         return sorted(expected_files, key=lambda path: path.as_posix())
 
     def _invalidate_existing_ready(self, drive_rg_folder_id: str) -> None:
@@ -331,14 +453,28 @@ class DriveUploader:
 
         declared_files = self._collect_declared_files(local_rg_dir)
         rg_folder_name = local_rg_dir.name
-        drive_rg_folder_id = self.find_or_create_folder(rg_folder_name, sources_folder_id)
+        matching_rg_folders = [
+            item
+            for item in self._list_children(sources_folder_id)
+            if item.get("name") == rg_folder_name
+            and item.get("mimeType") == self.FOLDER_MIME_TYPE
+        ]
+        if matching_rg_folders:
+            drive_rg_folder_id = matching_rg_folders[0]["id"]
+        else:
+            drive_rg_folder_id = self.find_or_create_folder(
+                rg_folder_name, sources_folder_id
+            )
         expected_files = set(declared_files)
         expected_directories: Set[Path] = set()
         for relative_path in expected_files:
             expected_directories.update(relative_path.parents)
         expected_directories.discard(Path("."))
 
-        self._invalidate_existing_ready(drive_rg_folder_id)
+        for folder in matching_rg_folders:
+            self._invalidate_existing_ready(folder["id"])
+        for duplicate_folder in matching_rg_folders[1:]:
+            self._trash_item(duplicate_folder["id"])
         self._reconcile_remote_tree(
             drive_rg_folder_id, expected_files, expected_directories
         )
